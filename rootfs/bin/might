@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# might — TinyMightyOS Package Manager
+# "might work, might not" (it always works)
+#
+# Usage: might <command> [args]
+
+set -euo pipefail
+
+# ── Config ─────────────────────────────────────────────────────────────────
+
+MIGHT_VERSION="1.0.0"
+MIGHT_DB="/var/lib/might"
+MIGHT_CACHE="/var/cache/might"
+MIGHT_REPO="${MIGHT_REPO:-https://packages.tinymightyos.example/repo}"
+MIGHT_INSTALLED="${MIGHT_DB}/installed"
+MIGHT_PKGDB="${MIGHT_DB}/packages.db"
+MIGHT_LOG="${MIGHT_DB}/might.log"
+MIGHT_LOCK="/run/might.lock"
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+ORANGE='\033[38;5;202m'
+RESET='\033[0m'
+
+die()    { echo -e "${RED}[might] error: $*${RESET}" >&2; exit 1; }
+info()   { echo -e "${CYAN}[might]${RESET} $*"; }
+ok()     { echo -e "${GREEN}[might] ✓${RESET} $*"; }
+warn()   { echo -e "${YELLOW}[might] ⚠${RESET} $*"; }
+banner() { echo -e "${ORANGE}[might]${RESET} $*"; }
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${MIGHT_LOG}" 2>/dev/null || true
+}
+
+# ── Lock ────────────────────────────────────────────────────────────────────
+
+lock_acquire() {
+    if [[ -f "${MIGHT_LOCK}" ]]; then
+        local pid; pid=$(cat "${MIGHT_LOCK}")
+        if kill -0 "${pid}" 2>/dev/null; then
+            die "another might process is running (pid ${pid})"
+        fi
+        rm -f "${MIGHT_LOCK}"
+    fi
+    echo $$ > "${MIGHT_LOCK}"
+    trap 'rm -f "${MIGHT_LOCK}"' EXIT INT TERM
+}
+
+# ── Init ────────────────────────────────────────────────────────────────────
+
+init_dirs() {
+    mkdir -p "${MIGHT_DB}" "${MIGHT_CACHE}" "${MIGHT_INSTALLED}"
+    touch "${MIGHT_PKGDB}" "${MIGHT_LOG}"
+}
+
+# ── Package DB (local flat-file) ─────────────────────────────────────────────
+# Format: name|version|description|deps|url|installed_files
+
+pkg_get_field() {
+    local name="$1" field="$2"
+    grep "^${name}|" "${MIGHT_PKGDB}" 2>/dev/null | head -1 | cut -d'|' -f"${field}"
+}
+
+pkg_is_installed() {
+    [[ -f "${MIGHT_INSTALLED}/${1}" ]]
+}
+
+pkg_mark_installed() {
+    local name="$1" version="$2"
+    echo "${version}" > "${MIGHT_INSTALLED}/${name}"
+    log "installed ${name} ${version}"
+}
+
+pkg_mark_removed() {
+    rm -f "${MIGHT_INSTALLED}/$1"
+    log "removed $1"
+}
+
+pkg_installed_version() {
+    cat "${MIGHT_INSTALLED}/${1}" 2>/dev/null || echo "not installed"
+}
+
+# ── Simulated package database ───────────────────────────────────────────────
+# In a real distro this comes from the repo. Here we seed a demo DB.
+
+seed_pkgdb() {
+    if [[ ! -s "${MIGHT_PKGDB}" ]]; then
+        info "seeding local package database..."
+        cat > "${MIGHT_PKGDB}" << 'EOF'
+neovim|0.10.0|Hyperextensible Vim-based text editor|libluajit|https://packages.example/neovim-0.10.0.tar.zst|
+firefox|128.0|Fast, private web browser|libgtk3,libdbus|https://packages.example/firefox-128.0.tar.zst|
+tmux|3.4|Terminal multiplexer|libevent,libncurses|https://packages.example/tmux-3.4.tar.zst|
+htop|3.3.0|Interactive process viewer|libncurses|https://packages.example/htop-3.3.0.tar.zst|
+git|2.45.0|Distributed version control|libcurl,libz,libssl|https://packages.example/git-2.45.0.tar.zst|
+ripgrep|14.1.0|Blazingly fast grep replacement||https://packages.example/ripgrep-14.1.0.tar.zst|
+fd|10.1.0|Fast find alternative||https://packages.example/fd-10.1.0.tar.zst|
+bat|0.24.0|Cat with wings (syntax highlighting)||https://packages.example/bat-0.24.0.tar.zst|
+fzf|0.54.0|Command-line fuzzy finder||https://packages.example/fzf-0.54.0.tar.zst|
+zstd|1.5.6|Fast lossless compression||https://packages.example/zstd-1.5.6.tar.zst|
+curl|8.8.0|URL transfer library and tool|libssl,libz|https://packages.example/curl-8.8.0.tar.zst|
+wget|1.21.4|Network downloader|libssl,libz|https://packages.example/wget-1.21.4.tar.zst|
+strace|6.9|System call tracer||https://packages.example/strace-6.9.tar.zst|
+gdb|14.2|GNU debugger|libpython3|https://packages.example/gdb-14.2.tar.zst|
+python3|3.12.4|Python programming language||https://packages.example/python3-3.12.4.tar.zst|
+rust|1.80.0|Systems programming language||https://packages.example/rust-1.80.0.tar.zst|
+go|1.22.5|Go programming language||https://packages.example/go-1.22.5.tar.zst|
+nodejs|22.5.0|JavaScript runtime|libssl|https://packages.example/nodejs-22.5.0.tar.zst|
+docker|27.1.0|Container runtime|libseccomp,libiptables|https://packages.example/docker-27.1.0.tar.zst|
+wireguard-tools|1.0.20210914|WireGuard VPN tools||https://packages.example/wireguard-tools-1.0.tar.zst|
+bloatware|0.0.1|Unnecessary software that wastes your disk||https://packages.example/bloatware-0.0.1.tar.zst|
+chaos-engine|9.9.9|Randomizes everything||https://packages.example/chaos-engine-9.9.9.tar.zst|
+EOF
+        ok "package database seeded (${MIGHT_PKGDB})"
+    fi
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_update() {
+    lock_acquire
+    init_dirs
+    info "updating package database from ${MIGHT_REPO}..."
+    # In a real distro: wget -qO "${MIGHT_PKGDB}.new" "${MIGHT_REPO}/packages.db"
+    # We simulate it:
+    seed_pkgdb
+    local count; count=$(wc -l < "${MIGHT_PKGDB}")
+    ok "package database updated (${count} packages)"
+    log "update: ${count} packages"
+}
+
+cmd_install() {
+    [[ $# -lt 1 ]] && die "install: package name required"
+    lock_acquire; init_dirs; seed_pkgdb
+
+    for pkg in "$@"; do
+        info "installing ${pkg}..."
+
+        local version; version=$(pkg_get_field "${pkg}" 2)
+        if [[ -z "${version}" ]]; then
+            die "package '${pkg}' not found. Try: might search ${pkg}"
+        fi
+
+        if pkg_is_installed "${pkg}"; then
+            local iv; iv=$(pkg_installed_version "${pkg}")
+            if [[ "${iv}" == "${version}" ]]; then
+                ok "${pkg} is already up to date (${version})"
+                continue
+            fi
+            info "upgrading ${pkg} from ${iv} to ${version}"
+        fi
+
+        local desc; desc=$(pkg_get_field "${pkg}" 3)
+        local deps; deps=$(pkg_get_field "${pkg}" 4)
+        local url;  url=$(pkg_get_field  "${pkg}" 5)
+
+        echo -e "  ${BLUE}Name:${RESET}    ${pkg}"
+        echo -e "  ${BLUE}Version:${RESET} ${version}"
+        echo -e "  ${BLUE}Desc:${RESET}    ${desc}"
+        [[ -n "${deps}" ]] && echo -e "  ${BLUE}Deps:${RESET}    ${deps}"
+
+        # install deps first
+        if [[ -n "${deps}" ]]; then
+            IFS=',' read -ra dep_list <<< "${deps}"
+            for dep in "${dep_list[@]}"; do
+                dep="${dep// /}"
+                if ! pkg_is_installed "${dep}"; then
+                    info "installing dependency: ${dep}"
+                    # recursion guard: try best effort
+                    local dver; dver=$(pkg_get_field "${dep}" 2)
+                    if [[ -n "${dver}" ]]; then
+                        _simulate_download "${dep}" "${dver}"
+                        pkg_mark_installed "${dep}" "${dver}"
+                    else
+                        warn "dependency '${dep}' not in DB, skipping"
+                    fi
+                fi
+            done
+        fi
+
+        _simulate_download "${pkg}" "${version}"
+        pkg_mark_installed "${pkg}" "${version}"
+        ok "installed ${pkg} ${version}"
+    done
+}
+
+_simulate_download() {
+    local name="$1" version="$2"
+    local steps=("Resolving" "Downloading" "Verifying" "Extracting" "Linking")
+    for step in "${steps[@]}"; do
+        printf "  ${CYAN}%-12s${RESET} %s %s" "${step}" "${name}" "${version}"
+        sleep 0.1
+        printf " ${GREEN}✓${RESET}\n"
+    done
+}
+
+cmd_remove() {
+    [[ $# -lt 1 ]] && die "remove: package name required"
+    lock_acquire; init_dirs
+
+    for pkg in "$@"; do
+        if ! pkg_is_installed "${pkg}"; then
+            warn "${pkg} is not installed"
+            continue
+        fi
+        info "removing ${pkg}..."
+        sleep 0.2
+        pkg_mark_removed "${pkg}"
+        ok "removed ${pkg}"
+    done
+}
+
+cmd_search() {
+    [[ $# -lt 1 ]] && die "search: query required"
+    init_dirs; seed_pkgdb
+
+    local query="$1"
+    info "searching for '${query}'..."
+    echo ""
+
+    local found=0
+    while IFS='|' read -r name version desc deps _ _; do
+        if echo "${name} ${desc}" | grep -qi "${query}"; then
+            local installed=""
+            pkg_is_installed "${name}" && installed=" ${GREEN}[installed]${RESET}"
+            printf "  ${CYAN}%-20s${RESET} ${YELLOW}%-10s${RESET} %s%b\n" \
+                "${name}" "${version}" "${desc}" "${installed}"
+            found=$((found + 1))
+        fi
+    done < "${MIGHT_PKGDB}"
+
+    echo ""
+    [[ ${found} -eq 0 ]] && warn "no packages found matching '${query}'" || ok "found ${found} package(s)"
+}
+
+cmd_info() {
+    [[ $# -lt 1 ]] && die "info: package name required"
+    init_dirs; seed_pkgdb
+
+    local pkg="$1"
+    local version; version=$(pkg_get_field "${pkg}" 2)
+    [[ -z "${version}" ]] && die "package '${pkg}' not found"
+
+    local desc; desc=$(pkg_get_field "${pkg}" 3)
+    local deps; deps=$(pkg_get_field "${pkg}" 4)
+    local url;  url=$(pkg_get_field  "${pkg}" 5)
+
+    local status; pkg_is_installed "${pkg}" \
+        && status="${GREEN}installed ($(pkg_installed_version "${pkg}"))${RESET}" \
+        || status="${YELLOW}not installed${RESET}"
+
+    echo ""
+    echo -e "  ${ORANGE}Package:${RESET}  ${pkg}"
+    echo -e "  ${ORANGE}Version:${RESET}  ${version}"
+    echo -e "  ${ORANGE}Desc:${RESET}     ${desc}"
+    echo -e "  ${ORANGE}Deps:${RESET}     ${deps:-none}"
+    echo -e "  ${ORANGE}URL:${RESET}      ${url}"
+    echo -e "  ${ORANGE}Status:${RESET}   $(echo -e "${status}")"
+    echo ""
+}
+
+cmd_list() {
+    init_dirs
+    local count=0
+    echo ""
+    for f in "${MIGHT_INSTALLED}"/*/; do
+        f="${f%/}"
+        local name="${f##*/}"
+        local ver; ver=$(cat "${MIGHT_INSTALLED}/${name}" 2>/dev/null || echo "?")
+        printf "  ${GREEN}%-24s${RESET} %s\n" "${name}" "${ver}"
+        count=$((count + 1))
+    done
+    # Also check flat files
+    for f in "${MIGHT_INSTALLED}"/*; do
+        [[ -d "${f}" ]] && continue
+        [[ -f "${f}" ]] || continue
+        local name="${f##*/}"
+        local ver; ver=$(cat "${f}")
+        printf "  ${GREEN}%-24s${RESET} %s\n" "${name}" "${ver}"
+        count=$((count + 1))
+    done
+    echo ""
+    [[ ${count} -eq 0 ]] && warn "no packages installed" || ok "${count} package(s) installed"
+}
+
+cmd_upgrade() {
+    init_dirs; seed_pkgdb
+    info "checking for upgrades..."
+    local upgraded=0
+
+    while IFS='|' read -r name version _ _ _ _; do
+        if pkg_is_installed "${name}"; then
+            local iv; iv=$(pkg_installed_version "${name}")
+            if [[ "${iv}" != "${version}" ]]; then
+                info "upgrading ${name}: ${iv} → ${version}"
+                _simulate_download "${name}" "${version}"
+                pkg_mark_installed "${name}" "${version}"
+                ok "${name} upgraded to ${version}"
+                upgraded=$((upgraded + 1))
+            fi
+        fi
+    done < "${MIGHT_PKGDB}"
+
+    [[ ${upgraded} -eq 0 ]] && ok "everything is up to date" || ok "${upgraded} package(s) upgraded"
+}
+
+cmd_yolo() {
+    init_dirs; seed_pkgdb
+    banner "YOLO MODE: installing a random package..."
+    local count; count=$(wc -l < "${MIGHT_PKGDB}")
+    local n=$(( (RANDOM % count) + 1 ))
+    local pkg; pkg=$(sed -n "${n}p" "${MIGHT_PKGDB}" | cut -d'|' -f1)
+    banner "Selected: ${pkg}"
+    cmd_install "${pkg}"
+}
+
+cmd_doctor() {
+    echo ""
+    echo -e "${ORANGE}  ╔══════════════════════════════╗${RESET}"
+    echo -e "${ORANGE}  ║   might doctor — system check ║${RESET}"
+    echo -e "${ORANGE}  ╚══════════════════════════════╝${RESET}"
+    echo ""
+
+    # Disk space
+    local avail; avail=$(df -h / 2>/dev/null | awk 'NR==2{print $4}')
+    local use;   use=$(df -h  / 2>/dev/null | awk 'NR==2{print $5}')
+    echo -e "  ${CYAN}Disk usage:${RESET} ${use} used, ${avail} free"
+
+    # Package count
+    local installed=0
+    for f in "${MIGHT_INSTALLED}"/*; do [[ -f "${f}" ]] && installed=$((installed+1)); done
+    echo -e "  ${CYAN}Installed packages:${RESET} ${installed}"
+
+    # Cache size
+    local cache_size; cache_size=$(du -sh "${MIGHT_CACHE}" 2>/dev/null | cut -f1)
+    echo -e "  ${CYAN}Cache size:${RESET} ${cache_size:-0}"
+
+    # Lock check
+    if [[ -f "${MIGHT_LOCK}" ]]; then
+        warn "stale lock file found at ${MIGHT_LOCK}"
+    else
+        ok "no stale locks"
+    fi
+
+    echo ""
+    ok "doctor complete. Your system is probably fine."
+    echo ""
+}
+
+cmd_help() {
+    echo ""
+    echo -e "${ORANGE}  might ${MIGHT_VERSION}${RESET} — TinyMightyOS Package Manager"
+    echo ""
+    echo -e "  ${CYAN}Commands:${RESET}"
+    echo "    install  <pkg...>   Install package(s)"
+    echo "    remove   <pkg...>   Remove package(s)"
+    echo "    search   <query>    Search packages"
+    echo "    info     <pkg>      Show package details"
+    echo "    list                List installed packages"
+    echo "    update              Update package database"
+    echo "    upgrade             Upgrade all installed packages"
+    echo "    yolo                Install a random package"
+    echo "    doctor              System health check"
+    echo "    help                Show this help"
+    echo ""
+    echo -e "  ${CYAN}Environment:${RESET}"
+    echo "    MIGHT_REPO          Package repository URL"
+    echo ""
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+main() {
+    [[ $# -eq 0 ]] && { cmd_help; exit 0; }
+
+    case "$1" in
+        install)  shift; cmd_install  "$@" ;;
+        remove)   shift; cmd_remove   "$@" ;;
+        search)   shift; cmd_search   "$@" ;;
+        info)     shift; cmd_info     "$@" ;;
+        list)     shift; cmd_list     "$@" ;;
+        update)   shift; cmd_update   "$@" ;;
+        upgrade)  shift; cmd_upgrade  "$@" ;;
+        yolo)     shift; cmd_yolo     "$@" ;;
+        doctor)   shift; cmd_doctor   "$@" ;;
+        help|-h|--help) cmd_help      ;;
+        *) die "unknown command: $1. Try: might help" ;;
+    esac
+}
+
+main "$@"

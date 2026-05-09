@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+# tmos-install — TinyMightyOS Installer
+# Installs TinyMightyOS to disk with a guided TUI.
+# Run from the live ISO: tmos-install
+
+set -euo pipefail
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+ORANGE='\033[38;5;202m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+SQUASHFS_SRC="/run/live/rootfs.squashfs"
+MOUNT_ROOT="/mnt/tmos-install"
+LOG="/tmp/tmos-install.log"
+
+die()  { echo -e "\n${RED}[install] FATAL: $*${RESET}" >&2; exit 1; }
+info() { echo -e "${CYAN}[install]${RESET} $*"; echo "[$(date)] $*" >> "${LOG}"; }
+ok()   { echo -e "${GREEN}[install] ✓${RESET} $*"; }
+warn() { echo -e "${YELLOW}[install] ⚠${RESET} $*"; }
+
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+hr() { echo -e "${ORANGE}──────────────────────────────────────────────────${RESET}"; }
+
+header() {
+    clear 2>/dev/null || true
+    echo ""
+    echo -e "${RED}${BOLD}"
+    echo "  ████████╗██╗███╗   ██╗██╗   ██╗"
+    echo "     ██╔══╝██║████╗  ██║╚██╗ ██╔╝"
+    echo "     ██║   ██║██╔██╗ ██║ ╚████╔╝ "
+    echo "     ██║   ██║██║╚██╗██║  ╚██╔╝  "
+    echo "     ██║   ██║██║ ╚████║   ██║   "
+    echo "     ╚═╝   ╚═╝╚═╝  ╚═══╝   ╚═╝  "
+    echo -e "     ${ORANGE}MIGHTY OS INSTALLER v1.0${RESET}"
+    echo ""
+    hr
+    echo ""
+}
+
+prompt() {
+    # prompt <var_name> <message> [default]
+    local var="$1" msg="$2" default="${3:-}"
+    local input
+    if [[ -n "${default}" ]]; then
+        echo -ne "${CYAN}  ${msg} [${default}]: ${RESET}"
+    else
+        echo -ne "${CYAN}  ${msg}: ${RESET}"
+    fi
+    read -r input
+    [[ -z "${input}" && -n "${default}" ]] && input="${default}"
+    printf -v "${var}" '%s' "${input}"
+}
+
+confirm() {
+    # confirm <message> — returns 0 if yes
+    local ans
+    echo -ne "${YELLOW}  $* [y/N]: ${RESET}"
+    read -r ans
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+step() {
+    local n="$1" total="$2" msg="$3"
+    echo ""
+    echo -e "  ${ORANGE}[${n}/${total}]${RESET} ${BOLD}${msg}${RESET}"
+    hr
+}
+
+progress() {
+    local label="$1" duration="${2:-2}"
+    local chars=("█" "█" "█" "░" "░")
+    local bar=""
+    echo -ne "  ${label} "
+    for i in $(seq 1 40); do
+        local pct=$(( i * 100 / 40 ))
+        bar="$(printf '█%.0s' $(seq 1 $((i/2))))$(printf '░%.0s' $(seq 1 $((20 - i/2))))"
+        echo -ne "\r  ${label} [${bar}] ${pct}%"
+        sleep "$(echo "scale=3; ${duration}/40" | bc 2>/dev/null || echo 0.05)"
+    done
+    echo -e "\r  ${label} [${bar}] ${GREEN}done${RESET}      "
+}
+
+# ── System checks ─────────────────────────────────────────────────────────────
+
+preflight() {
+    step 0 8 "Pre-flight checks"
+
+    [[ $(id -u) -eq 0 ]] || die "Must run as root"
+    ok "Running as root"
+
+    [[ -f "${SQUASHFS_SRC}" ]] || {
+        warn "SquashFS not found at ${SQUASHFS_SRC} — assuming dev/test mode"
+        SQUASHFS_SRC=""
+    }
+
+    command -v mkfs.ext4 &>/dev/null || die "mkfs.ext4 not found"
+    command -v grub-install &>/dev/null || warn "grub-install not found — bootloader step will be skipped"
+    ok "Required tools present"
+
+    local mem_mb; mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    (( mem_mb < 512 )) && warn "Low memory: ${mem_mb}MiB (recommend 512MiB+)"
+    ok "Memory: ${mem_mb}MiB"
+}
+
+# ── Disk selection ────────────────────────────────────────────────────────────
+
+select_disk() {
+    step 1 8 "Select installation disk"
+    echo ""
+    echo "  Available block devices:"
+    echo ""
+
+    local devs=()
+    while IFS= read -r line; do
+        local dev size model
+        dev=$(echo "${line}"  | awk '{print $1}')
+        size=$(echo "${line}" | awk '{print $2}')
+        model=$(echo "${line}"| awk '{$1=$2=""; print $0}' | xargs)
+        echo -e "  ${CYAN}${dev}${RESET}  ${size}  ${model}"
+        devs+=("${dev}")
+    done < <(lsblk -d -n -o NAME,SIZE,MODEL 2>/dev/null | grep -v '^loop' || echo "sda 20G Unknown")
+
+    echo ""
+    prompt TARGET_DISK "Target disk (e.g. /dev/sda)" "/dev/sda"
+
+    [[ -b "${TARGET_DISK}" ]] || warn "Device ${TARGET_DISK} not found (test mode: continuing)"
+
+    echo ""
+    echo -e "  ${RED}${BOLD}WARNING: All data on ${TARGET_DISK} will be DESTROYED.${RESET}"
+    echo ""
+    confirm "Are you absolutely sure?" || die "Installation aborted by user"
+}
+
+# ── Partition ─────────────────────────────────────────────────────────────────
+
+partition_disk() {
+    step 2 8 "Partitioning ${TARGET_DISK}"
+
+    local use_uefi=0
+    [[ -d /sys/firmware/efi ]] && use_uefi=1
+
+    if (( use_uefi )); then
+        info "UEFI mode detected — creating GPT layout"
+        # GPT: EFI (512M) + root (rest)
+        if [[ -b "${TARGET_DISK}" ]]; then
+            parted -s "${TARGET_DISK}" mklabel gpt \
+                mkpart ESP  fat32  1MiB  513MiB \
+                set 1 esp on \
+                mkpart root ext4   513MiB 100%
+        fi
+        BOOT_PART="${TARGET_DISK}1"
+        ROOT_PART="${TARGET_DISK}2"
+        BOOT_FS="vfat"
+    else
+        info "BIOS mode — creating MBR layout"
+        if [[ -b "${TARGET_DISK}" ]]; then
+            parted -s "${TARGET_DISK}" mklabel msdos \
+                mkpart primary ext4 1MiB 513MiB \
+                set 1 boot on \
+                mkpart primary ext4 513MiB 100%
+        fi
+        BOOT_PART="${TARGET_DISK}1"
+        ROOT_PART="${TARGET_DISK}2"
+        BOOT_FS="ext4"
+    fi
+
+    USE_UEFI=${use_uefi}
+    ok "Partitioning complete: boot=${BOOT_PART} root=${ROOT_PART}"
+}
+
+# ── Format ────────────────────────────────────────────────────────────────────
+
+format_disk() {
+    step 3 8 "Formatting partitions"
+
+    progress "Formatting root (ext4)" 1
+    if [[ -b "${ROOT_PART}" ]]; then
+        mkfs.ext4 -L tinymightyos -F "${ROOT_PART}" >> "${LOG}" 2>&1
+    fi
+    ok "Root: ext4"
+
+    progress "Formatting boot" 0.5
+    if [[ -b "${BOOT_PART}" ]]; then
+        if [[ "${BOOT_FS}" == "vfat" ]]; then
+            mkfs.vfat -F32 -n EFI "${BOOT_PART}" >> "${LOG}" 2>&1
+        else
+            mkfs.ext4 -L boot -F "${BOOT_PART}" >> "${LOG}" 2>&1
+        fi
+    fi
+    ok "Boot: ${BOOT_FS}"
+}
+
+# ── Mount ─────────────────────────────────────────────────────────────────────
+
+mount_target() {
+    step 4 8 "Mounting target filesystems"
+
+    mkdir -p "${MOUNT_ROOT}"
+    if [[ -b "${ROOT_PART}" ]]; then
+        mount "${ROOT_PART}" "${MOUNT_ROOT}"
+    fi
+    mkdir -p "${MOUNT_ROOT}/boot"
+    if [[ -b "${BOOT_PART}" ]]; then
+        mount "${BOOT_PART}" "${MOUNT_ROOT}/boot"
+    fi
+    ok "Mounted ${ROOT_PART} -> ${MOUNT_ROOT}"
+}
+
+# ── Copy rootfs ───────────────────────────────────────────────────────────────
+
+copy_rootfs() {
+    step 5 8 "Installing TinyMightyOS"
+
+    if [[ -n "${SQUASHFS_SRC}" ]]; then
+        progress "Unpacking SquashFS" 5
+        unsquashfs -d "${MOUNT_ROOT}" -f "${SQUASHFS_SRC}" >> "${LOG}" 2>&1
+        ok "SquashFS extracted"
+    else
+        warn "SquashFS not available — creating minimal rootfs skeleton"
+        progress "Creating rootfs skeleton" 1
+        local dirs=(bin sbin lib lib64 usr/bin usr/sbin usr/lib etc dev proc sys tmp
+                    var/log var/run var/lib root home boot run
+                    etc/tmos/services etc/tmos/might)
+        for d in "${dirs[@]}"; do mkdir -p "${MOUNT_ROOT}/${d}"; done
+        # symlinks
+        for link in bin sbin lib lib64; do
+            [[ -L "${MOUNT_ROOT}/${link}" ]] || \
+                ln -sf "usr/${link}" "${MOUNT_ROOT}/${link}" 2>/dev/null || true
+        done
+        ok "Rootfs skeleton created"
+    fi
+}
+
+# ── Configure ─────────────────────────────────────────────────────────────────
+
+configure_system() {
+    step 6 8 "Configuring system"
+
+    prompt HOSTNAME "Hostname" "tinymightyos"
+    prompt USERNAME "Username (non-root)" "user"
+    echo -ne "${CYAN}  Password for ${USERNAME}: ${RESET}"
+    read -rs USER_PASS; echo ""
+    echo -ne "${CYAN}  Root password: ${RESET}"
+    read -rs ROOT_PASS; echo ""
+
+    # hostname
+    echo "${HOSTNAME}" > "${MOUNT_ROOT}/etc/hostname"
+    ok "Hostname: ${HOSTNAME}"
+
+    # hosts
+    cat > "${MOUNT_ROOT}/etc/hosts" << EOF
+127.0.0.1   localhost
+127.0.1.1   ${HOSTNAME}
+::1         localhost ip6-localhost ip6-loopback
+EOF
+
+    # os release
+    mkdir -p "${MOUNT_ROOT}/etc/tmos"
+    cat > "${MOUNT_ROOT}/etc/tmos/release" << EOF
+TinyMightyOS 1.0.0 "Unhinged Ungulate"
+EOF
+    cat > "${MOUNT_ROOT}/etc/os-release" << EOF
+NAME="TinyMightyOS"
+VERSION="1.0.0"
+ID=tinymightyos
+VERSION_CODENAME="unhinged-ungulate"
+PRETTY_NAME="TinyMightyOS 1.0.0 (Unhinged Ungulate)"
+HOME_URL="https://github.com/anaghnathwani/tinymightyos"
+EOF
+
+    # /etc/passwd, shadow, group (simplified)
+    cat >> "${MOUNT_ROOT}/etc/passwd" << EOF
+root:x:0:0:root:/root:/bin/tmsh
+${USERNAME}:x:1000:1000:${USERNAME}:/home/${USERNAME}:/bin/tmsh
+EOF
+    cat >> "${MOUNT_ROOT}/etc/group" << EOF
+root:x:0:
+wheel:x:10:${USERNAME}
+${USERNAME}:x:1000:
+EOF
+
+    mkdir -p "${MOUNT_ROOT}/home/${USERNAME}"
+
+    # fstab
+    local root_uuid="" boot_uuid=""
+    if [[ -b "${ROOT_PART}" ]]; then
+        root_uuid=$(blkid -s UUID -o value "${ROOT_PART}" 2>/dev/null || echo "")
+        boot_uuid=$(blkid -s UUID -o value "${BOOT_PART}" 2>/dev/null || echo "")
+    fi
+
+    cat > "${MOUNT_ROOT}/etc/fstab" << EOF
+# TinyMightyOS fstab
+# <device>              <mount>   <type>   <options>              <dump> <pass>
+${root_uuid:+UUID=}${root_uuid:-${ROOT_PART}}  /         ext4     defaults,noatime           0      1
+${boot_uuid:+UUID=}${boot_uuid:-${BOOT_PART}}  /boot     ${BOOT_FS}     defaults                   0      2
+tmpfs                   /tmp      tmpfs    mode=1777,size=20%     0      0
+tmpfs                   /run      tmpfs    mode=755,size=10%      0      0
+EOF
+
+    # tmshrc
+    cat > "${MOUNT_ROOT}/etc/tmos/tmshrc" << 'EOF'
+# TinyMightyOS global tmshrc
+alias ll='ls -lahF --color=auto'
+alias la='ls -lAhF --color=auto'
+alias l='ls -lhF --color=auto'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias g='git'
+alias v='nvim'
+alias grep='grep --color=auto'
+alias df='df -h'
+alias du='du -sh'
+alias ip='ip --color=auto'
+alias diff='diff --color=auto'
+fetch
+EOF
+
+    ok "System configured"
+}
+
+# ── Bootloader ────────────────────────────────────────────────────────────────
+
+install_bootloader() {
+    step 7 8 "Installing bootloader"
+
+    if ! command -v grub-install &>/dev/null; then
+        warn "grub-install not available — skipping"
+        return
+    fi
+
+    progress "Installing GRUB" 2
+
+    if (( USE_UEFI )); then
+        if [[ -b "${TARGET_DISK}" ]]; then
+            grub-install --target=x86_64-efi \
+                         --efi-directory="${MOUNT_ROOT}/boot" \
+                         --boot-directory="${MOUNT_ROOT}/boot" \
+                         --removable >> "${LOG}" 2>&1
+        fi
+    else
+        if [[ -b "${TARGET_DISK}" ]]; then
+            grub-install --target=i386-pc \
+                         --boot-directory="${MOUNT_ROOT}/boot" \
+                         "${TARGET_DISK}" >> "${LOG}" 2>&1
+        fi
+    fi
+
+    # GRUB config
+    mkdir -p "${MOUNT_ROOT}/boot/grub"
+    cat > "${MOUNT_ROOT}/boot/grub/grub.cfg" << 'EOF'
+# TinyMightyOS GRUB configuration
+set default=0
+set timeout=3
+
+insmod all_video
+insmod gfxterm
+insmod gfxmenu
+
+set gfxmode=1024x768
+terminal_output gfxterm
+
+# colors
+set color_normal=white/black
+set color_highlight=light-red/black
+
+menuentry "TinyMightyOS 1.0.0 (Unhinged Ungulate)" --class tinymightyos {
+    insmod ext2
+    search --no-floppy --label --set=root tinymightyos
+    linux  /boot/vmlinuz root=LABEL=tinymightyos rw quiet splash loglevel=3 \
+           preempt=full mitigations=off zswap.enabled=1 zswap.compressor=zstd \
+           systemd.show_status=0 rd.udev.log_level=3
+    initrd /boot/initrd.img
+}
+
+menuentry "TinyMightyOS (recovery mode)" --class tinymightyos {
+    insmod ext2
+    search --no-floppy --label --set=root tinymightyos
+    linux  /boot/vmlinuz root=LABEL=tinymightyos rw single debug loglevel=7
+    initrd /boot/initrd.img
+}
+
+menuentry "TinyMightyOS (read-only / overlay)" --class tinymightyos {
+    insmod ext2
+    search --no-floppy --label --set=root tinymightyos
+    linux  /boot/vmlinuz root=LABEL=tinymightyos ro overlay=tmpfs quiet
+    initrd /boot/initrd.img
+}
+
+if [ "${grub_platform}" = "efi" ]; then
+    menuentry "UEFI Firmware Settings" {
+        fwsetup
+    }
+fi
+EOF
+
+    ok "GRUB installed and configured"
+}
+
+# ── Finalize ──────────────────────────────────────────────────────────────────
+
+finalize() {
+    step 8 8 "Finalizing installation"
+
+    progress "Syncing filesystems" 1
+    sync
+
+    if mountpoint -q "${MOUNT_ROOT}" 2>/dev/null; then
+        umount -R "${MOUNT_ROOT}" 2>/dev/null || true
+    fi
+
+    ok "Installation complete!"
+}
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+print_summary() {
+    echo ""
+    hr
+    echo -e "  ${GREEN}${BOLD}TinyMightyOS Installation Complete!${RESET}"
+    hr
+    echo ""
+    echo -e "  ${CYAN}Target:${RESET}    ${TARGET_DISK}"
+    echo -e "  ${CYAN}Hostname:${RESET}  ${HOSTNAME}"
+    echo -e "  ${CYAN}User:${RESET}      ${USERNAME}"
+    echo -e "  ${CYAN}Log:${RESET}       ${LOG}"
+    echo ""
+    echo -e "  ${ORANGE}What's next:${RESET}"
+    echo "    1. Remove the installation media"
+    echo "    2. Reboot: tmos-init reboot"
+    echo "    3. Login as ${USERNAME}"
+    echo "    4. Run: tmos-fetch"
+    echo "    5. Run: might yolo"
+    echo "    6. Enable chaos: chaos on"
+    echo ""
+    echo -e "  ${RED}${BOLD}BE UNGOVERNABLE${RESET}"
+    echo ""
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    header
+    echo -e "  ${BOLD}Welcome to the TinyMightyOS installer.${RESET}"
+    echo -e "  This will install TinyMightyOS to your disk."
+    echo -e "  ${RED}All existing data on the target disk will be destroyed.${RESET}"
+    echo ""
+    confirm "Ready to proceed?" || { echo "Aborted."; exit 0; }
+
+    preflight
+    select_disk
+    partition_disk
+    format_disk
+    mount_target
+    copy_rootfs
+    configure_system
+    install_bootloader
+    finalize
+    print_summary
+}
+
+main "$@"

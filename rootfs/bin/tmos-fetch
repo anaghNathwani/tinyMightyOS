@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# tmos-fetch — TinyMightyOS system info fetcher
+# Like neofetch, but angrier and more opinionated.
+
+set -euo pipefail
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+MAGENTA='\033[1;35m'
+CYAN='\033[1;36m'
+ORANGE='\033[38;5;202m'
+PINK='\033[38;5;205m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ── Logo ──────────────────────────────────────────────────────────────────────
+
+logo() {
+cat << 'LOGO'
+  ████████╗██╗███╗   ██╗██╗   ██╗
+     ██╔══╝██║████╗  ██║╚██╗ ██╔╝
+     ██║   ██║██╔██╗ ██║ ╚████╔╝
+     ██║   ██║██║╚██╗██║  ╚██╔╝
+     ██║   ██║██║ ╚████║   ██║
+     ╚═╝   ╚═╝╚═╝  ╚═══╝   ╚═╝
+  ███╗   ███╗██╗ ██████╗ ██╗  ██╗████████╗██╗   ██╗
+  ████╗ ████║██║██╔════╝ ██║  ██║╚══██╔══╝╚██╗ ██╔╝
+  ██╔████╔██║██║██║  ███╗███████║   ██║    ╚████╔╝
+  ██║╚██╔╝██║██║██║   ██║██╔══██║   ██║     ╚██╔╝
+  ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║   ██║      ██║
+  ╚═╝     ╚═╝╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝      ╚═╝
+LOGO
+}
+
+# ── Gather info ───────────────────────────────────────────────────────────────
+
+get_os()       { cat /etc/tmos/release 2>/dev/null || echo "TinyMightyOS 1.0.0"; }
+get_kernel()   { uname -r 2>/dev/null || echo "unknown"; }
+get_host()     { hostname 2>/dev/null || echo "tinymightyos"; }
+get_user()     { echo "${USER:-$(id -un)}"; }
+get_shell()    { basename "${SHELL:-tmsh}"; }
+get_term()     { echo "${TERM:-unknown}"; }
+
+get_uptime() {
+    if [[ -f /proc/uptime ]]; then
+        local secs; secs=$(awk '{print int($1)}' /proc/uptime)
+        local d=$(( secs / 86400 ))
+        local h=$(( (secs % 86400) / 3600 ))
+        local m=$(( (secs % 3600) / 60 ))
+        local s=$(( secs % 60 ))
+        local result=""
+        [[ $d -gt 0 ]] && result+="${d}d "
+        [[ $h -gt 0 ]] && result+="${h}h "
+        [[ $m -gt 0 ]] && result+="${m}m "
+        result+="${s}s"
+        echo "${result}"
+    else
+        echo "unknown"
+    fi
+}
+
+get_cpu() {
+    if [[ -f /proc/cpuinfo ]]; then
+        local model; model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
+        local cores; cores=$(grep -c '^processor' /proc/cpuinfo)
+        echo "${model} (${cores} cores)"
+    else
+        echo "unknown"
+    fi
+}
+
+get_memory() {
+    if [[ -f /proc/meminfo ]]; then
+        local total used avail
+        total=$(grep MemTotal    /proc/meminfo | awk '{print $2}')
+        avail=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+        used=$(( total - avail ))
+        printf "%d MiB / %d MiB" "$(( used / 1024 ))" "$(( total / 1024 ))"
+    else
+        echo "unknown"
+    fi
+}
+
+get_disk() {
+    df -h / 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s)", $3, $2, $5}' \
+        || echo "unknown"
+}
+
+get_load() {
+    if [[ -f /proc/loadavg ]]; then
+        awk '{print $1" "$2" "$3}' /proc/loadavg
+    else
+        echo "unknown"
+    fi
+}
+
+get_packages() {
+    local count=0
+    if [[ -d /var/lib/might/installed ]]; then
+        count=$(find /var/lib/might/installed -maxdepth 1 -type f 2>/dev/null | wc -l)
+    fi
+    echo "${count} (might)"
+}
+
+get_init() {
+    if [[ -f /proc/1/comm ]]; then
+        cat /proc/1/comm
+    else
+        echo "tmos-init"
+    fi
+}
+
+get_resolution() {
+    if command -v xrandr &>/dev/null; then
+        xrandr 2>/dev/null | grep ' connected' | awk '{print $4}' | head -1
+    elif [[ -f /sys/class/graphics/fb0/virtual_size ]]; then
+        cat /sys/class/graphics/fb0/virtual_size | tr ',' 'x'
+    else
+        echo "unknown"
+    fi
+}
+
+get_ip() {
+    ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}' | head -1 || echo "none"
+}
+
+get_cpu_freq() {
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]]; then
+        local khz; khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+        printf "%.1f GHz" "$(echo "scale=1; ${khz}/1000000" | bc 2>/dev/null || echo "?")"
+    else
+        echo "unknown"
+    fi
+}
+
+get_entropy() {
+    cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || echo "?"
+}
+
+get_processes() {
+    ls /proc 2>/dev/null | grep -c '^[0-9]' || echo "?"
+}
+
+# ── Color swatches ────────────────────────────────────────────────────────────
+
+color_swatches() {
+    echo -n "  "
+    for c in 1 2 3 4 5 6 7 202 205 226 46 39; do
+        echo -ne "\033[48;5;${c}m   \033[0m"
+    done
+    echo ""
+    echo -n "  "
+    for c in 8 9 10 11 12 13 14 202 205 226 46 39; do
+        echo -ne "\033[48;5;${c}m   \033[0m"
+    done
+    echo ""
+}
+
+# ── Fun facts ─────────────────────────────────────────────────────────────────
+
+fun_fact() {
+    local facts=(
+        "TinyMightyOS boots faster than you can say 'systemd'"
+        "tmos-init is 400 lines of C. systemd is 1.4 million."
+        "might install chaos-engine — you know you want to"
+        "'chaos on' in tmsh unlocks true power"
+        "The kernel has PREEMPT_RT. Your UI will never stutter."
+        "io_uring: async I/O so fast it breaks causality"
+        "BPF JIT enabled. Trace everything. Know everything."
+        "This distro was built from scratch. RESPECT."
+        "musl libc: tiny, correct, and it doesn't phone home"
+        "BBR congestion control. Your network just got faster."
+    )
+    local idx=$(( RANDOM % ${#facts[@]} ))
+    echo "${facts[$idx]}"
+}
+
+# ── Roast mode ────────────────────────────────────────────────────────────────
+
+roast() {
+    local mem_mb; mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+    local cores; cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+
+    local roasts=()
+
+    (( mem_mb < 512  )) && roasts+=("Only ${mem_mb}MiB RAM? Even TinyMightyOS is embarrassed for you.")
+    (( mem_mb > 65536)) && roasts+=("${mem_mb}MiB RAM? Compensating for something?")
+    (( cores == 1 ))    && roasts+=("Single core? Bold of you to call this a computer.")
+    (( cores > 128 ))   && roasts+=("${cores} cores? Are you running a data center or a distro?")
+
+    if [[ ${#roasts[@]} -gt 0 ]]; then
+        local idx=$(( RANDOM % ${#roasts[@]} ))
+        echo -e "\n  ${PINK}[roast]${RESET} ${roasts[$idx]}"
+    fi
+}
+
+# ── Main output ───────────────────────────────────────────────────────────────
+
+main() {
+    local user host
+    user=$(get_user)
+    host=$(get_host)
+
+    echo ""
+    echo -e "${RED}"
+    logo
+    echo -e "${RESET}"
+
+    local sep="${DIM}──────────────────────────────────────────${RESET}"
+
+    printf "  ${CYAN}%-14s${RESET} %s@%s\n"  "User"        "${user}" "${host}"
+    printf "  ${CYAN}%-14s${RESET} %s\n"      "OS"          "$(get_os)"
+    printf "  ${CYAN}%-14s${RESET} %s\n"      "Kernel"      "$(get_kernel)"
+    printf "  ${CYAN}%-14s${RESET} %s\n"      "Init"        "$(get_init)"
+    printf "  ${CYAN}%-14s${RESET} %s\n"      "Shell"       "$(get_shell)"
+    printf "  ${CYAN}%-14s${RESET} %s\n"      "Terminal"    "$(get_term)"
+    echo -e "  ${sep}"
+    printf "  ${YELLOW}%-14s${RESET} %s\n"    "CPU"         "$(get_cpu)"
+    printf "  ${YELLOW}%-14s${RESET} %s\n"    "CPU Freq"    "$(get_cpu_freq)"
+    printf "  ${YELLOW}%-14s${RESET} %s\n"    "Memory"      "$(get_memory)"
+    printf "  ${YELLOW}%-14s${RESET} %s\n"    "Disk"        "$(get_disk)"
+    printf "  ${YELLOW}%-14s${RESET} %s\n"    "Load"        "$(get_load)"
+    echo -e "  ${sep}"
+    printf "  ${GREEN}%-14s${RESET} %s\n"     "Uptime"      "$(get_uptime)"
+    printf "  ${GREEN}%-14s${RESET} %s\n"     "Processes"   "$(get_processes)"
+    printf "  ${GREEN}%-14s${RESET} %s\n"     "Packages"    "$(get_packages)"
+    printf "  ${GREEN}%-14s${RESET} %s\n"     "IP"          "$(get_ip)"
+    printf "  ${GREEN}%-14s${RESET} %s bits\n" "Entropy"   "$(get_entropy)"
+    echo -e "  ${sep}"
+    echo ""
+    color_swatches
+    echo ""
+    echo -e "  ${ORANGE}💡 $(fun_fact)${RESET}"
+    roast
+    echo ""
+    echo -e "  ${RED}${BOLD}BE UNGOVERNABLE${RESET}"
+    echo ""
+}
+
+main "$@"

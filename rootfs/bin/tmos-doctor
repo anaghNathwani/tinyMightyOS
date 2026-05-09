@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# tmos-doctor — TinyMightyOS system health checker
+# Checks everything. Roasts you. Tells you what's wrong.
+
+set -euo pipefail
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+ORANGE='\033[38;5;202m'
+RESET='\033[0m'
+
+PASS=0
+WARN=0
+FAIL=0
+
+pass()   { echo -e "  ${GREEN}[PASS]${RESET} $*"; PASS=$((PASS+1)); }
+warn()   { echo -e "  ${YELLOW}[WARN]${RESET} $*"; WARN=$((WARN+1)); }
+fail()   { echo -e "  ${RED}[FAIL]${RESET} $*"; FAIL=$((FAIL+1)); }
+header() { echo -e "\n${CYAN}── $* ──${RESET}"; }
+
+# ── Checks ────────────────────────────────────────────────────────────────────
+
+check_kernel() {
+    header "Kernel"
+    local ver; ver=$(uname -r 2>/dev/null || echo "unknown")
+    pass "Kernel: ${ver}"
+
+    if uname -r | grep -q 'tinymightyos'; then
+        pass "Running TinyMightyOS custom kernel"
+    else
+        warn "Not running TinyMightyOS kernel (got: ${ver})"
+    fi
+
+    # Check PREEMPT_RT
+    if [[ -f /sys/kernel/realtime ]]; then
+        local rt; rt=$(cat /sys/kernel/realtime)
+        [[ "${rt}" == "1" ]] && pass "PREEMPT_RT: enabled" || warn "PREEMPT_RT: not active"
+    else
+        warn "PREEMPT_RT: cannot determine (missing /sys/kernel/realtime)"
+    fi
+
+    # BPF
+    if [[ -f /proc/sys/kernel/bpf_stats_enabled ]]; then
+        pass "BPF: available"
+    else
+        warn "BPF: /proc/sys/kernel/bpf_stats_enabled missing"
+    fi
+
+    # io_uring
+    if grep -q io_uring /proc/filesystems 2>/dev/null || \
+       [[ -f /proc/sys/kernel/io_uring_disabled ]]; then
+        pass "io_uring: available"
+    else
+        warn "io_uring: not detected"
+    fi
+}
+
+check_memory() {
+    header "Memory"
+    local total avail used_pct
+    total=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+    used_pct=$(( (total - avail) * 100 / total ))
+
+    pass "Total: $((total / 1024)) MiB"
+    pass "Available: $((avail / 1024)) MiB"
+
+    if (( used_pct < 70 )); then
+        pass "Memory pressure: low (${used_pct}% used)"
+    elif (( used_pct < 90 )); then
+        warn "Memory pressure: moderate (${used_pct}% used)"
+    else
+        fail "Memory pressure: HIGH (${used_pct}% used) — might need more RAM"
+    fi
+
+    # Swap
+    local swap_total; swap_total=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
+    if (( swap_total > 0 )); then
+        pass "Swap: $((swap_total / 1024)) MiB available"
+    else
+        warn "Swap: none configured (recommend ZRAM or swap partition)"
+    fi
+
+    # ZRAM
+    if ls /dev/zram* &>/dev/null 2>&1; then
+        pass "ZRAM: device(s) present"
+    else
+        warn "ZRAM: no zram devices (consider enabling for memory compression)"
+    fi
+}
+
+check_disk() {
+    header "Disk"
+    local use_pct; use_pct=$(df / | awk 'NR==2{print $5}' | tr -d '%')
+
+    if (( use_pct < 70 )); then
+        pass "Root disk: ${use_pct}% used"
+    elif (( use_pct < 90 )); then
+        warn "Root disk: ${use_pct}% used — getting full"
+    else
+        fail "Root disk: ${use_pct}% used — CRITICAL: clean up now"
+    fi
+
+    # Filesystem type
+    local fstype; fstype=$(stat -f -c %T / 2>/dev/null || echo "unknown")
+    case "${fstype}" in
+        btrfs) pass "Root filesystem: btrfs (excellent choice, CoW gang)" ;;
+        ext4)  pass "Root filesystem: ext4 (solid, respectable)" ;;
+        xfs)   pass "Root filesystem: XFS (nice)" ;;
+        *)     warn "Root filesystem: ${fstype} (unusual)" ;;
+    esac
+
+    # tmp
+    if mountpoint -q /tmp 2>/dev/null; then
+        pass "/tmp: mounted (tmpfs)"
+    else
+        warn "/tmp: not a separate mount (fills root disk)"
+    fi
+}
+
+check_network() {
+    header "Network"
+
+    # Interfaces
+    local ifs; ifs=$(ip link show 2>/dev/null | awk -F': ' '/^[0-9]/{print $2}' | grep -v lo || true)
+    if [[ -n "${ifs}" ]]; then
+        pass "Network interfaces: $(echo "${ifs}" | tr '\n' ' ')"
+    else
+        fail "No network interfaces found (besides lo)"
+    fi
+
+    # Default route
+    if ip route show default &>/dev/null 2>&1; then
+        local gw; gw=$(ip route show default | awk '{print $3}' | head -1)
+        pass "Default route: ${gw}"
+    else
+        warn "No default route — no internet access"
+    fi
+
+    # DNS
+    if [[ -f /etc/resolv.conf ]]; then
+        local ns; ns=$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | head -1)
+        if [[ -n "${ns}" ]]; then
+            pass "DNS nameserver: ${ns}"
+        else
+            warn "DNS: /etc/resolv.conf has no nameservers"
+        fi
+    else
+        fail "DNS: /etc/resolv.conf missing"
+    fi
+
+    # WireGuard
+    if ip link show type wireguard &>/dev/null 2>&1; then
+        pass "WireGuard: active interface(s) found"
+    else
+        warn "WireGuard: no active tunnels (consider using it)"
+    fi
+}
+
+check_security() {
+    header "Security"
+
+    # ASLR
+    local aslr; aslr=$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null || echo "0")
+    case "${aslr}" in
+        2) pass "ASLR: full randomization (mode 2)" ;;
+        1) warn "ASLR: partial (mode 1) — set to 2 for maximum security" ;;
+        0) fail "ASLR: DISABLED — danger" ;;
+        *) warn "ASLR: unknown mode ${aslr}" ;;
+    esac
+
+    # Kernel pointers
+    local kptr; kptr=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo "0")
+    (( kptr >= 1 )) && pass "kptr_restrict: ${kptr}" || warn "kptr_restrict: 0 (kernel pointers exposed)"
+
+    # dmesg restriction
+    local dmesg_r; dmesg_r=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null || echo "0")
+    (( dmesg_r == 1 )) && pass "dmesg_restrict: enabled" || warn "dmesg_restrict: disabled"
+
+    # Seccomp
+    if grep -q Seccomp /proc/self/status 2>/dev/null; then
+        pass "Seccomp: available"
+    else
+        warn "Seccomp: not available in this kernel"
+    fi
+
+    # Landlock
+    if [[ -d /sys/kernel/security/landlock ]]; then
+        pass "Landlock: enabled"
+    else
+        warn "Landlock: not available (kernel may not have it)"
+    fi
+
+    # Root login
+    if [[ "${USER:-root}" == "root" ]]; then
+        warn "Running as root — don't do this in production"
+    else
+        pass "Not running as root (user: ${USER})"
+    fi
+}
+
+check_services() {
+    header "Services"
+
+    if [[ -d /etc/tmos/services ]]; then
+        local count; count=$(ls /etc/tmos/services/*.svc 2>/dev/null | wc -l)
+        pass "Service definitions found: ${count}"
+    else
+        warn "No TinyMightyOS service directory at /etc/tmos/services"
+    fi
+
+    # PID 1
+    local pid1; pid1=$(cat /proc/1/comm 2>/dev/null || echo "unknown")
+    if [[ "${pid1}" == "tmos-init" ]]; then
+        pass "PID 1: tmos-init (correct)"
+    else
+        warn "PID 1: ${pid1} (not tmos-init — are you running in a container?)"
+    fi
+
+    # Key services
+    for svc in tmos-netd tmos-logd tmos-crond; do
+        if pgrep -x "${svc}" &>/dev/null; then
+            pass "Service ${svc}: running"
+        else
+            warn "Service ${svc}: not running"
+        fi
+    done
+}
+
+check_tools() {
+    header "Required Tools"
+    local tools=(tmsh might tmos-fetch tmos-install bash grep awk sed find)
+    for tool in "${tools[@]}"; do
+        if command -v "${tool}" &>/dev/null; then
+            pass "${tool}: $(command -v "${tool}")"
+        else
+            warn "${tool}: not found in PATH"
+        fi
+    done
+}
+
+check_entropy() {
+    header "Entropy & Randomness"
+    if [[ -f /proc/sys/kernel/random/entropy_avail ]]; then
+        local ent; ent=$(cat /proc/sys/kernel/random/entropy_avail)
+        if (( ent > 2000 )); then
+            pass "Entropy pool: ${ent} bits (healthy)"
+        elif (( ent > 512 )); then
+            warn "Entropy pool: ${ent} bits (acceptable)"
+        else
+            fail "Entropy pool: ${ent} bits (LOW — crypto ops will be slow)"
+        fi
+    fi
+
+    if [[ -c /dev/urandom ]]; then
+        pass "/dev/urandom: present"
+    else
+        fail "/dev/urandom: MISSING — serious problem"
+    fi
+}
+
+# ── Report ────────────────────────────────────────────────────────────────────
+
+print_report() {
+    local total=$(( PASS + WARN + FAIL ))
+    echo ""
+    echo -e "${ORANGE}══════════════════════════════════${RESET}"
+    echo -e "${ORANGE}  tmos-doctor report${RESET}"
+    echo -e "${ORANGE}══════════════════════════════════${RESET}"
+    echo -e "  ${GREEN}PASS:${RESET} ${PASS}"
+    echo -e "  ${YELLOW}WARN:${RESET} ${WARN}"
+    echo -e "  ${RED}FAIL:${RESET} ${FAIL}"
+    echo -e "  Total checks: ${total}"
+    echo ""
+
+    if (( FAIL > 0 )); then
+        echo -e "  ${RED}Status: UNHEALTHY — fix the FAILs above${RESET}"
+    elif (( WARN > 5 )); then
+        echo -e "  ${YELLOW}Status: MARGINAL — address warnings${RESET}"
+    else
+        echo -e "  ${GREEN}Status: HEALTHY — TinyMightyOS is ready to be ungovernable${RESET}"
+    fi
+    echo ""
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    echo ""
+    echo -e "${RED}${BOLD}  tmos-doctor — TinyMightyOS System Health Check${RESET}"
+    echo -e "${ORANGE}  Checking everything. Judging silently.${RESET}"
+
+    check_kernel
+    check_memory
+    check_disk
+    check_network
+    check_security
+    check_services
+    check_tools
+    check_entropy
+
+    print_report
+}
+
+# allow sourcing without running
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

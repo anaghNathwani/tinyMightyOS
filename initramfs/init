@@ -1,0 +1,115 @@
+#!/bin/sh
+# TinyMightyOS initramfs init
+# Minimal PID 1 for early boot: mounts, finds root, pivots, execs tmos-init
+
+set -e
+
+# Early setup
+mount -t proc     none /proc
+mount -t sysfs    none /sys
+mount -t devtmpfs none /dev 2>/dev/null || \
+    mount -t tmpfs none /dev && mknod /dev/null c 1 3
+
+echo ""
+echo -e "\033[1;31m  [tmos] initramfs starting\033[0m"
+
+# Parse kernel command line
+ROOT=""
+ROOTFLAGS="ro"
+OVERLAY=""
+INSTALL=""
+
+for param in $(cat /proc/cmdline); do
+    case "${param}" in
+        root=*)           ROOT="${param#root=}" ;;
+        rootflags=*)      ROOTFLAGS="${param#rootflags=}" ;;
+        overlay=*)        OVERLAY="${param#overlay=}" ;;
+        tmos.install=*)   INSTALL="${param#tmos.install=}" ;;
+        rw)               ROOTFLAGS="rw" ;;
+        ro)               ROOTFLAGS="ro" ;;
+    esac
+done
+
+# If root not specified, try common defaults
+if [ -z "${ROOT}" ]; then
+    ROOT="LABEL=tinymightyos"
+fi
+
+echo "  [tmos] root=${ROOT} flags=${ROOTFLAGS}"
+
+# Wait for devices to settle
+sleep 0.5
+if [ -x /bin/udevadm ]; then
+    /sbin/udevd --daemon 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+    udevadm settle  2>/dev/null || true
+fi
+
+# Mount root
+mkdir -p /mnt/root
+
+mount_root() {
+    local dev="${1}"
+
+    # Handle LABEL= and UUID=
+    if echo "${dev}" | grep -q '^LABEL='; then
+        dev=$(findfs "${dev}" 2>/dev/null || blkid -L "${dev#LABEL=}" 2>/dev/null || echo "")
+    elif echo "${dev}" | grep -q '^UUID='; then
+        dev=$(blkid -U "${dev#UUID=}" 2>/dev/null || echo "")
+    fi
+
+    [ -z "${dev}" ] && return 1
+    [ -b "${dev}" ] || return 1
+
+    mount -o "${ROOTFLAGS}" "${dev}" /mnt/root
+}
+
+# Try mounting root with retries
+RETRIES=10
+while [ ${RETRIES} -gt 0 ]; do
+    if mount_root "${ROOT}" 2>/dev/null; then
+        echo "  [tmos] root mounted: ${ROOT}"
+        break
+    fi
+    RETRIES=$((RETRIES - 1))
+    echo "  [tmos] waiting for root device... (${RETRIES})"
+    sleep 0.5
+done
+
+if ! mountpoint -q /mnt/root; then
+    echo "  [tmos] FATAL: could not mount root ${ROOT}"
+    echo "  [tmos] dropping to emergency shell"
+    exec /bin/sh
+fi
+
+# Overlay mode: mount root read-only with tmpfs overlay on top
+if [ -n "${OVERLAY}" ]; then
+    echo "  [tmos] overlay mode: ${OVERLAY}"
+    mkdir -p /mnt/upper /mnt/work
+    mount -t tmpfs tmpfs /mnt/upper
+    mkdir -p /mnt/upper/upper /mnt/upper/work
+    mount -t overlay overlay \
+        -o lowerdir=/mnt/root,upperdir=/mnt/upper/upper,workdir=/mnt/upper/work \
+        /mnt/root
+    echo "  [tmos] overlay mounted (writes go to tmpfs)"
+fi
+
+# Move essential mounts into new root
+for mp in proc sys dev; do
+    mkdir -p "/mnt/root/${mp}"
+    mount --move "/${mp}" "/mnt/root/${mp}" 2>/dev/null || true
+done
+
+# Handle install mode
+if [ "${INSTALL}" = "1" ]; then
+    echo "  [tmos] install mode: launching tmos-install"
+    exec chroot /mnt/root /usr/bin/tmos-install
+fi
+
+# Switch root and exec init
+echo "  [tmos] switching root -> /mnt/root, exec tmos-init"
+exec switch_root /mnt/root /sbin/tmos-init
+
+# Fallback
+echo "  [tmos] switch_root failed, exec sh in new root"
+exec chroot /mnt/root /bin/sh

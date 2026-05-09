@@ -1,0 +1,65 @@
+# TinyMightyOS GRUB2 Theme
+# "Maximum Aggression"
+
+title-text: "TinyMightyOS 1.0.0"
+title-color: "#FF4500"
+message-color: "#EAEAEA"
+message-bg-color: "#1A1A2E"
+desktop-color: "#1A1A2E"
+desktop-image: "background.png"
+
++ boot_menu {
+    left = 15%
+    top = 35%
+    width = 70%
+    height = 40%
+    item_color = "#EAEAEA"
+    item_height = 28
+    item_padding = 8
+    selected_item_color = "#FF4500"
+    selected_item_pixmap_style = "select_*.png"
+    item_font = "Hack Bold 16"
+    scrollbar = false
+    scrollbar_frame = "scrollbar_*.png"
+    scrollbar_thumb = "scrollbar_thumb*.png"
+    scrollbar_slice = "3"
+    scrollbar_left_pad = 0
+    icon_space = 36
+    icon_height = 24
+    icon_width = 24
+    item_spacing = 4
+}
+
++ label {
+    top = 90%
+    left = 0
+    width = 100%
+    align = "center"
+    text = "BE UNGOVERNABLE"
+    color = "#E94560"
+    font = "Hack Bold 14"
+}
+
++ label {
+    top = 93%
+    left = 0
+    width = 100%
+    align = "center"
+    text = "↑↓ select  ENTER boot  'e' edit  'c' console"
+    color = "#888888"
+    font = "Hack Regular 11"
+}
+
++ progress_bar {
+    id = "__timeout__"
+    left = 15%
+    top = 80%
+    width = 70%
+    height = 8
+    fg_color = "#FF4500"
+    bg_color = "#333355"
+    border_color = "#444466"
+    text_color = "#EAEAEA"
+    text = "Booting in %d seconds..."
+    font = "Hack Regular 12"
+}
