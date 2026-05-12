@@ -50,11 +50,73 @@ TinyMightyOS
 ### Requirements
 
 - Linux host (any distro)
-- `gcc`, `make`, `bash`, `wget`, `xorriso`, `mksquashfs`
+- No manual dependency installation required: `might install` will bootstrap host tools automatically
 - ~10GB disk space
 - A reckless attitude
 
-### Quick Build
+## Multi-Distro Installation on Apple Silicon
+
+The `might install` command provides a unified installation interface for multiple Linux ARM distributions optimized for dual-boot with macOS on Apple Silicon Macs (M1/M2/M3/M4).
+
+### Installation Flow
+
+1. **Clone the repository** — `git clone https://github.com/anaghNathwani/tinymightyos.git && cd tinymightyos`
+2. **Run `might install`** — Auto-chmod and present distro menu
+3. **Select a distro** — TinyMightyOS, Arch, Ubuntu, Debian, or Fedora
+4. **Choose target disk** — Select an internal partition or volume
+5. **Confirm and write** — Image is downloaded/built and written to disk
+6. **Reboot and select** — Boot into Startup Options and choose your new OS
+
+### Supported Distros
+
+| Distro | Base | Size | Boot Speed | Use Case |
+|--------|------|------|------------|----------|
+| TinyMightyOS | musl + custom | ~200MB | <2s | Minimal, embedded, experimental |
+| Arch Linux ARM | pacman, systemd | ~500MB | ~3-5s | Cutting-edge, rolling release |
+| Ubuntu 24.04 LTS | apt, systemd | ~3-5GB | ~5-8s | Stable, LTS, beginner-friendly |
+| Debian 12 | apt, systemd | ~2-4GB | ~5-8s | Conservative, stable, server-ready |
+| Fedora 40 | dnf, systemd | ~3-5GB | ~5-8s | Latest packages, RPM-based |
+
+### Installation Example
+
+```bash
+# Interactive menu
+might install
+
+# Direct install (skip menu)
+might install ubuntu
+```
+
+The installer will:
+- Ensure Homebrew is installed on macOS
+- Download the distro image if missing
+- Present a GUI to select target disk/partition
+- Format and write the image
+- Preserve existing EFI boot environment
+
+### Post-Installation Boot
+
+After installation completes:
+
+1. Reboot the Mac
+2. Hold the **power button** until Startup Options appear
+3. Select the new Linux volume from the boot list
+4. Complete first-boot setup (varies by distro)
+
+### Switching Between Distros
+
+To boot back to macOS: reboot, hold power, select Macintosh HD.
+To boot to another distro: repeat the above with the different distro volume.
+
+### Uninstalling a Distro
+
+1. Boot macOS
+2. Open Disk Utility
+3. Select the Linux volume/partition
+4. Click **Erase**
+5. Restore space to APFS container (if needed)
+
+## Single-Distro Building (Advanced)
 
 ```bash
 # Build everything for the host architecture
@@ -81,33 +143,59 @@ The build system can produce aarch64 artifacts and the installer can preserve an
 TARGET_ARCH=aarch64 ./scripts/build-all.sh
 ```
 
-#### Write the ISO to USB on macOS
+#### macOS Internal Installer (No USB Required)
 
-1. Build the ISO on Linux or inside a Linux VM/container accessible from macOS.
-2. Copy the ISO to USB with macOS utilities:
+TinyMightyOS can now install directly from macOS without requiring USB media.
+The installer will:
+
+- install missing macOS dependencies via Homebrew,
+- build the TinyMightyOS ISO in the repository,
+- write the bootable image to an internal target disk or partition,
+- preserve the existing EFI boot environment when possible.
+
+Use the repository helper:
 
 ```bash
-diskutil list
-sudo diskutil unmountDisk /dev/diskN
-sudo dd if=build/tinymightyos.iso of=/dev/rdiskN bs=4m status=progress
-sync
+chmod +x ./scripts/might ./macos/macos-install.sh
+./scripts/might install
 ```
 
-3. Alternatively use `balenaEtcher` or `Rufus` on a supported host.
+On first run the helper also registers `might` into `/usr/local/bin` so later invocations are available globally.
+
+The installer GUI will guide you through disk selection and perform the necessary partition and image operations.
 
 #### Booting on Apple Silicon
 
-- Connect the USB installer.
-- Power on the Mac and hold the power button until Startup Options appear.
-- Select the external boot device.
-- If macOS prevents external booting, enable "Allow booting from external media" in macOS Recovery security settings.
+- After the installer finishes writing the internal install image, reboot the Mac and hold the power button until Startup Options appear.
+- Select the TinyMightyOS target volume from the internal boot list.
+- If the volume does not appear, boot into Recovery and ensure the Mac is allowed to boot from new internal volumes.
 
-#### Installing alongside macOS
+#### Installing alongside macOS (Dual Boot)
 
-- In the installer, choose the target disk.
-- When prompted, enable dual-boot preservation to keep the existing EFI partition.
-- The installer will create a new root partition and preserve the macOS firmware boot environment.
-- After installation, boot into Startup Options again and choose TinyMightyOS from the external or internal boot list.
+1. Backup your macOS data first. Dual booting involves partitioning the internal storage and can destroy data if the wrong disk is selected.
+2. Open Disk Utility and create free space for TinyMightyOS:
+   - Select your internal APFS container.
+   - Choose "Partition" or "Add Volume" and leave at least 40GB free for TinyMightyOS.
+   - If you want a safer path, create a new APFS volume instead of resizing the existing macOS container.
+3. Use `diskutil list` in Terminal to identify the target disk and partition layout. The internal Apple Silicon disk is usually `/dev/disk0`.
+4. Run the GUI installer and let it build the ISO automatically from the repository:
+
+```bash
+chmod +x ./scripts/might ./macos/macos-install.sh
+./scripts/might install
+```
+
+5. In the installer, choose an internal target disk or partition that is safe to overwrite.
+6. The installer will preserve the EFI boot environment and leave macOS intact when you target a secondary volume.
+7. After install completes, reboot and hold the power button to open Startup Options.
+8. Select TinyMightyOS from the internal boot list to start the new OS.
+
+##### Notes for Apple Silicon dual boot
+
+- If the Mac does not show the TinyMightyOS volume, reboot and hold the power button to choose the internal volume from the firmware boot picker.
+- Apple Silicon boots through Startup Options, so TinyMightyOS may appear only after selecting the new internal volume manually.
+- To keep macOS first and TinyMightyOS second, install TinyMightyOS to a separate internal volume and use Startup Options at boot.
+- To remove TinyMightyOS later, boot into macOS Recovery, use Disk Utility to delete the TinyMightyOS volume, and restore free space to the APFS container.
 
 #### Intel Macs and other UEFI PCs
 
@@ -131,8 +219,27 @@ sync
 ## Running
 
 ```bash
-# QEMU (recommended for testing)
-./scripts/run-qemu.sh
+# Clone and install with a single command (auto-chmod included)
+git clone https://github.com/anaghNathwani/tinymightyos.git
+cd tinymightyos
+might install
+```
+
+This launches an interactive menu to choose a Linux distro:
+
+1. **TinyMightyOS** — custom lightweight distro optimized for Apple Silicon
+2. **Arch Linux ARM** — rolling release, minimal base install
+3. **Ubuntu 24.04 LTS ARM** — Debian-based, long-term support
+4. **Debian 12 ARM** — stable, conservative release cycle
+5. **Fedora 40 ARM** — RPM-based, cutting-edge packages
+
+All distros are configured for dual-boot with macOS on Apple Silicon Macs.
+
+To skip the menu and install directly:
+
+```bash
+might install tinymightyos    # or: arch, ubuntu, debian, fedora
+```
 
 # With KVM acceleration
 ./scripts/run-qemu.sh --kvm
@@ -149,6 +256,9 @@ sync
 ```bash
 # Install a package
 might install firefox
+
+# Launch the installer from the live environment
+might install
 
 # Remove a package
 might remove bloatware

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# might — TinyMightyOS host launcher
+# On macOS, `might install` launches the TinyMightyOS GUI installer.
+
+set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ $# -eq 0 ]]; then
+    cat <<'EOF'
+Usage: might <command> [args]
+
+Commands:
+  install      Launch the TinyMightyOS installer on macOS.
+  help         Show this help message.
+EOF
+    exit 0
+fi
+
+case "$1" in
+    install)
+        shift
+        if [[ $# -gt 0 ]]; then
+            echo "This host helper only supports 'might install' without package arguments." >&2
+            echo "To install packages inside TinyMightyOS, run the package manager from within the live environment." >&2
+            exit 1
+        fi
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+            echo "The macOS GUI installer is only available on macOS." >&2
+            exit 1
+        fi
+
+        exec "$ROOT_DIR/macos/macos-install.sh"
+        ;;
+    help|-h|--help)
+        shift
+        cat <<'EOF'
+Usage: might install
+
+Launch the TinyMightyOS macOS GUI installer. This helper writes the selected ISO to a disk and prepares boot media.
+EOF
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        echo "Try: might help" >&2
+        exit 1
+        ;;
+esac

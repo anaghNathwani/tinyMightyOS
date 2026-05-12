@@ -134,7 +134,13 @@ cmd_update() {
 }
 
 cmd_install() {
-    [[ $# -lt 1 ]] && die "install: package name required"
+    if [[ $# -eq 0 ]]; then
+        if command -v tmos-install >/dev/null 2>&1; then
+            info "launching TinyMightyOS installer..."
+            exec tmos-install
+        fi
+        die "install: package name required. Run 'might install <pkg>' to install packages or 'tmos-install' to launch the installer."
+    fi
     lock_acquire; init_dirs; seed_pkgdb
 
     for pkg in "$@"; do
@@ -356,7 +362,7 @@ cmd_help() {
     echo -e "${ORANGE}  might ${MIGHT_VERSION}${RESET} — TinyMightyOS Package Manager"
     echo ""
     echo -e "  ${CYAN}Commands:${RESET}"
-    echo "    install  <pkg...>   Install package(s)"
+    echo "    install  <pkg...>   Install package(s) or run the installer when no package is given"
     echo "    remove   <pkg...>   Remove package(s)"
     echo "    search   <query>    Search packages"
     echo "    info     <pkg>      Show package details"

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# might — TinyMightyOS multi-distro repo launcher
+# Installs TinyMightyOS or other Linux distros on macOS M-series Macs with dual-boot support.
+
+set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Auto-chmod self and supporting scripts
+auto_chmod() {
+    [[ -x "${ROOT_DIR}/might" ]] || chmod +x "${ROOT_DIR}/might"
+    [[ -x "${ROOT_DIR}/macos/macos-install.sh" ]] || chmod +x "${ROOT_DIR}/macos/macos-install.sh"
+    [[ -x "${ROOT_DIR}/scripts/host-bootstrap.sh" ]] || chmod +x "${ROOT_DIR}/scripts/host-bootstrap.sh"
+    [[ -x "${ROOT_DIR}/scripts/distro-orchestrator.sh" ]] || chmod +x "${ROOT_DIR}/scripts/distro-orchestrator.sh"
+    [[ -x "${ROOT_DIR}/distros/tinymightyos/build.sh" ]] 2>/dev/null || chmod +x "${ROOT_DIR}/distros/tinymightyos/build.sh" 2>/dev/null || true
+    [[ -x "${ROOT_DIR}/distros/arch/build.sh" ]] 2>/dev/null || chmod +x "${ROOT_DIR}/distros/arch/build.sh" 2>/dev/null || true
+    [[ -x "${ROOT_DIR}/distros/ubuntu/build.sh" ]] 2>/dev/null || chmod +x "${ROOT_DIR}/distros/ubuntu/build.sh" 2>/dev/null || true
+    [[ -x "${ROOT_DIR}/distros/fedora/build.sh" ]] 2>/dev/null || chmod +x "${ROOT_DIR}/distros/fedora/build.sh" 2>/dev/null || true
+}
+
+install_self_if_missing() {
+    if command -v might >/dev/null 2>&1; then
+        return
+    fi
+
+    local target="/usr/local/bin/might"
+    if [[ ! -w $(dirname "$target") && $EUID -ne 0 ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            echo "[might] Installing command wrapper to ${target}..."
+            sudo ln -sf "${ROOT_DIR}/might" "${target}"
+        else
+            echo "[might] Unable to install global command wrapper because sudo is unavailable." >&2
+            return
+        fi
+    else
+        echo "[might] Installing command wrapper to ${target}..."
+        ln -sf "${ROOT_DIR}/might" "${target}"
+    fi
+    echo "[might] Installed /usr/local/bin/might. You can now run 'might install' from any shell."
+}
+
+usage() {
+    cat <<EOF
+Usage: might <command> [options]
+
+Commands:
+  install [DISTRO]    Select and install a Linux distro on macOS.
+                      Supported: tinymightyos, arch, ubuntu, fedora, debian
+  bootstrap           Install required host build tools (macOS or Linux).
+  help                Show this help message.
+
+Examples:
+  might install                    (interactive menu)
+  might install tinymightyos       (directly install TinyMightyOS)
+  might install arch               (directly install Arch Linux ARM)
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+auto_chmod
+
+case "$1" in
+    install)
+        install_self_if_missing
+
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            local distro="${2:-}"
+            exec "${ROOT_DIR}/scripts/distro-orchestrator.sh" "${distro}"
+        fi
+
+        echo "[might] Running host bootstrap before install."
+        exec "${ROOT_DIR}/scripts/host-bootstrap.sh"
+        ;;
+    bootstrap)
+        exec "${ROOT_DIR}/scripts/host-bootstrap.sh"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage
+        exit 1
+        ;;
+esac
