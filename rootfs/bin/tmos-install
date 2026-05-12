@@ -17,6 +17,7 @@ RESET='\033[0m'
 SQUASHFS_SRC="/run/live/rootfs.squashfs"
 MOUNT_ROOT="/mnt/tmos-install"
 LOG="/tmp/tmos-install.log"
+PRESERVE_DUALBOOT=0
 
 die()  { echo -e "\n${RED}[install] FATAL: $*${RESET}" >&2; exit 1; }
 info() { echo -e "${CYAN}[install]${RESET} $*"; echo "[$(date)] $*" >> "${LOG}"; }
@@ -132,8 +133,15 @@ select_disk() {
     [[ -b "${TARGET_DISK}" ]] || warn "Device ${TARGET_DISK} not found (test mode: continuing)"
 
     echo ""
-    echo -e "  ${RED}${BOLD}WARNING: All data on ${TARGET_DISK} will be DESTROYED.${RESET}"
+    echo -e "  ${RED}${BOLD}WARNING: All data on ${TARGET_DISK} may be DESTROYED.${RESET}"
     echo ""
+    if [[ -d /sys/firmware/efi ]]; then
+        if confirm "Preserve existing EFI and macOS partitions for dual boot?"; then
+            PRESERVE_DUALBOOT=1
+            ok "Dual-boot mode enabled"
+        fi
+    fi
+
     confirm "Are you absolutely sure?" || die "Installation aborted by user"
 }
 
@@ -146,17 +154,49 @@ partition_disk() {
     [[ -d /sys/firmware/efi ]] && use_uefi=1
 
     if (( use_uefi )); then
-        info "UEFI mode detected — creating GPT layout"
-        # GPT: EFI (512M) + root (rest)
-        if [[ -b "${TARGET_DISK}" ]]; then
-            parted -s "${TARGET_DISK}" mklabel gpt \
-                mkpart ESP  fat32  1MiB  513MiB \
-                set 1 esp on \
-                mkpart root ext4   513MiB 100%
+        info "UEFI mode detected"
+
+        if (( PRESERVE_DUALBOOT )); then
+            info "Preserving existing EFI partition for dual boot"
+            local existing_parts before after newpart
+            before=$(lsblk -nr -o NAME "${TARGET_DISK}" | sort)
+            if [[ -b "${TARGET_DISK}" ]]; then
+                parted -s "${TARGET_DISK}" mkpart primary ext4 513MiB 100%
+            fi
+            after=$(lsblk -nr -o NAME "${TARGET_DISK}" | sort)
+            newpart=$(comm -13 <(echo "${before}") <(echo "${after}") | tail -n1)
+
+            if [[ -z "${newpart}" ]]; then
+                warn "Could not identify new root partition. Falling back to full disk install."
+                PRESERVE_DUALBOOT=0
+            else
+                ROOT_PART="/dev/${newpart}"
+                BOOT_PART=$(blkid -t PARTLABEL=EFI -o device 2>/dev/null || blkid -t TYPE=vfat -o device 2>/dev/null || true)
+                BOOT_FS="vfat"
+                if [[ -z "${BOOT_PART}" ]]; then
+                    warn "Existing EFI partition not found; creating a new EFI partition."
+                    if [[ -b "${TARGET_DISK}" ]]; then
+                        parted -s "${TARGET_DISK}" mklabel gpt \
+                            mkpart ESP fat32 1MiB 513MiB \
+                            set 1 esp on
+                        BOOT_PART="${TARGET_DISK}1"
+                    fi
+                fi
+            fi
         fi
-        BOOT_PART="${TARGET_DISK}1"
-        ROOT_PART="${TARGET_DISK}2"
-        BOOT_FS="vfat"
+
+        if (( PRESERVE_DUALBOOT == 0 )); then
+            info "Creating GPT layout — EFI + root"
+            if [[ -b "${TARGET_DISK}" ]]; then
+                parted -s "${TARGET_DISK}" mklabel gpt \
+                    mkpart ESP  fat32  1MiB  513MiB \
+                    set 1 esp on \
+                    mkpart root ext4   513MiB 100%
+            fi
+            BOOT_PART="${TARGET_DISK}1"
+            ROOT_PART="${TARGET_DISK}2"
+            BOOT_FS="vfat"
+        fi
     else
         info "BIOS mode — creating MBR layout"
         if [[ -b "${TARGET_DISK}" ]]; then
@@ -187,13 +227,19 @@ format_disk() {
 
     progress "Formatting boot" 0.5
     if [[ -b "${BOOT_PART}" ]]; then
-        if [[ "${BOOT_FS}" == "vfat" ]]; then
-            mkfs.vfat -F32 -n EFI "${BOOT_PART}" >> "${LOG}" 2>&1
+        if (( PRESERVE_DUALBOOT )) && [[ "${BOOT_FS}" == "vfat" ]]; then
+            ok "Boot: preserving existing EFI partition"
         else
-            mkfs.ext4 -L boot -F "${BOOT_PART}" >> "${LOG}" 2>&1
+            if [[ "${BOOT_FS}" == "vfat" ]]; then
+                mkfs.vfat -F32 -n EFI "${BOOT_PART}" >> "${LOG}" 2>&1
+            else
+                mkfs.ext4 -L boot -F "${BOOT_PART}" >> "${LOG}" 2>&1
+            fi
+            ok "Boot: ${BOOT_FS}"
         fi
+    else
+        warn "Boot partition missing; installer may fail"
     fi
-    ok "Boot: ${BOOT_FS}"
 }
 
 # ── Mount ─────────────────────────────────────────────────────────────────────
@@ -334,11 +380,16 @@ install_bootloader() {
         return
     fi
 
+    local grub_target="x86_64-efi"
+    if [[ "$(uname -m)" == "aarch64" ]]; then
+        grub_target="arm64-efi"
+    fi
+
     progress "Installing GRUB" 2
 
     if (( USE_UEFI )); then
         if [[ -b "${TARGET_DISK}" ]]; then
-            grub-install --target=x86_64-efi \
+            grub-install --target="${grub_target}" \
                          --efi-directory="${MOUNT_ROOT}/boot" \
                          --boot-directory="${MOUNT_ROOT}/boot" \
                          --removable >> "${LOG}" 2>&1

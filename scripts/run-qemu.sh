@@ -12,6 +12,7 @@ RESET='\033[0m'
 
 die()  { echo -e "${RED}[qemu] $*${RESET}" >&2; exit 1; }
 info() { echo -e "${CYAN}[qemu]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[qemu] WARNING: $*${RESET}" >&2; }
 ok()   { echo -e "${GREEN}[qemu] ✓${RESET} $*"; }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -22,6 +23,7 @@ DISK="${DISK:-}"
 USE_KVM=0
 USE_UEFI=0
 SERIAL_ONLY=0
+TARGET_ARCH="${TARGET_ARCH:-x86_64}"
 ISO="${BUILD_DIR}/tinymightyos.iso"
 VMLINUZ="${BUILD_DIR}/vmlinuz"
 INITRD="${BUILD_DIR}/initrd.img"
@@ -39,8 +41,9 @@ while [[ $# -gt 0 ]]; do
         --iso=*)       ISO="${1#*=}" ;;
         --kernel=*)    VMLINUZ="${1#*=}" ;;
         --initrd=*)    INITRD="${1#*=}" ;;
+        --arch=*)      TARGET_ARCH="${1#*=}" ;;
         -h|--help)
-            echo "Usage: $0 [--kvm] [--uefi] [--serial] [--ram=2G] [--cpus=N] [--disk=image.qcow2]"
+            echo "Usage: $0 [--kvm] [--uefi] [--serial] [--ram=2G] [--cpus=N] [--disk=image.qcow2] [--arch=x86_64|aarch64]"
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -48,21 +51,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Check qemu ────────────────────────────────────────────────────────────────
-
-QEMU="qemu-system-x86_64"
-command -v "${QEMU}" &>/dev/null || die "${QEMU} not found. Install qemu-system-x86"
+if [[ "${TARGET_ARCH}" == "aarch64" ]]; then
+    QEMU="qemu-system-aarch64"
+    command -v "${QEMU}" &>/dev/null || die "${QEMU} not found. Install qemu-system-aarch64"
+else
+    QEMU="qemu-system-x86_64"
+    command -v "${QEMU}" &>/dev/null || die "${QEMU} not found. Install qemu-system-x86_64"
+fi
 
 info "TinyMightyOS QEMU launcher"
+info "RAM: ${RAM} | CPUs: ${CPUS} | ARCH: ${TARGET_ARCH"
 info "RAM: ${RAM} | CPUs: ${CPUS}"
 
 # ── Build QEMU args ───────────────────────────────────────────────────────────
-
-QEMU_ARGS=(
-    -name "TinyMightyOS"
-    -m "${RAM}"
-    -smp "${CPUS}"
-    -cpu host
 )
+
+if [[ "${TARGET_ARCH}" == "aarch64" ]]; then
+    QEMU_ARGS+=( -cpu cortex-a72 )
+else
+    QEMU_ARGS+=( -cpu host )
+fi
+
+(( USE_KVM )) && QEMU_ARGS+=(-enable-kvm) && info "KVM acceleration enabled"
+
+# Machine
+if [[ "${TARGET_ARCH}" == "aarch64" ]]; then
+    QEMU_ARGS+=(-machine virt)
+else
+    QEMU_ARGS+=(-machine q35)
+fi
 
 (( USE_KVM )) && QEMU_ARGS+=(-enable-kvm) && info "KVM acceleration enabled"
 
@@ -73,16 +90,25 @@ QEMU_ARGS+=(-machine q35)
 if (( SERIAL_ONLY )); then
     QEMU_ARGS+=(-nographic -serial mon:stdio)
     info "Serial-only mode"
-else
-    QEMU_ARGS+=(-vga virtio -display sdl,gl=on 2>/dev/null || -vga virtio)
-    QEMU_ARGS+=(-serial mon:stdio)
-fi
+elseif [[ "${TARGET_ARCH}" == "aarch64" ]]; then
+        for p in /usr/share/AAVMF/AAVMF_CODE.fd \
+                  /usr/share/aavmf/AAVMF_CODE.fd \
+                  /usr/share/edk2/aarch64/AAVMF_CODE.fd; do
+            [[ -f "${p}" ]] && ovmf="${p}" && break
+        done
+    else
+        for p in /usr/share/OVMF/OVMF_CODE.fd \
+                  /usr/share/ovmf/OVMF.fd \
+                  /usr/share/edk2/x64/OVMF_CODE.fd; do
+            [[ -f "${p}" ]] && ovmf="${p}" && break
+        done
+    fi
 
-# Network
-QEMU_ARGS+=(
-    -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80
-    -device virtio-net-pci,netdev=net0
-)
+    if [[ -n "${ovmf}" ]]; then
+        QEMU_ARGS+=(-bios "${ovmf}")
+        info "UEFI: ${ovmf}"
+    else
+        warn "UEFI firmware
 
 # UEFI
 if (( USE_UEFI )); then

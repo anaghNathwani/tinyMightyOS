@@ -49,7 +49,26 @@ MUSL_URL="https://musl.libc.org/releases/${MUSL_TARBALL}"
 BUSYBOX_TARBALL="busybox-${BUSYBOX_VERSION}.tar.bz2"
 BUSYBOX_URL="https://busybox.net/downloads/${BUSYBOX_TARBALL}"
 
-TARGET_ARCH="${TARGET_ARCH:-x86_64}"
+HOST_ARCH="$(uname -m)"
+TARGET_ARCH="${TARGET_ARCH:-${HOST_ARCH}}"
+
+case "${TARGET_ARCH}" in
+    x86_64)
+        KERNEL_ARCH="x86_64"
+        GRUB_ISO_TARGET="x86_64-efi"
+        ISO_LABEL="TINYMIGHTYOS"
+        ;;
+    aarch64|arm64)
+        TARGET_ARCH="aarch64"
+        KERNEL_ARCH="arm64"
+        GRUB_ISO_TARGET="arm64-efi"
+        ISO_LABEL="TINYMIGHTYOS-AARCH64"
+        ;;
+    *)
+        die "Unsupported TARGET_ARCH: ${TARGET_ARCH}. Supported: x86_64, aarch64"
+        ;;
+ esac
+
 CROSS_COMPILE="${TARGET_ARCH}-linux-musl-"
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -86,14 +105,23 @@ extract() {
 phase_check() {
     info "Checking build requirements..."
     require_cmd gcc make bash wget tar find install strip
-    require_cmd xorriso mksquashfs || warn "xorriso/mksquashfs not found — ISO build may fail"
+    if ! command -v xorriso &>/dev/null; then
+        warn "xorriso not found — ISO build may fail"
+    fi
+    if ! command -v mksquashfs &>/dev/null; then
+        warn "mksquashfs not found — ISO build may fail"
+    fi
 
-    # Check for cross compiler
-    if ! command -v "${CROSS_COMPILE}gcc" &>/dev/null; then
-        warn "Cross compiler ${CROSS_COMPILE}gcc not found — will attempt native build"
-        CROSS_COMPILE=""
+    # Check for cross compiler when needed
+    if [[ "${TARGET_ARCH}" != "${HOST_ARCH}" && ! -z "${CROSS_COMPILE}" ]]; then
+        if ! command -v "${CROSS_COMPILE}gcc" &>/dev/null; then
+            warn "Cross compiler ${CROSS_COMPILE}gcc not found — will attempt native build if possible"
+            CROSS_COMPILE=""
+        else
+            ok "Cross compiler: ${CROSS_COMPILE}gcc"
+        fi
     else
-        ok "Cross compiler: ${CROSS_COMPILE}gcc"
+        ok "Host and target arch match: ${HOST_ARCH}"
     fi
 
     mkdir -p "${BUILD_DIR}" "${SRC_DIR}" "${ROOTFS_DIR}" "${INITRAMFS_DIR}" "${ISO_DIR}"
@@ -128,10 +156,20 @@ phase_musl() {
 
     info "Building musl ${MUSL_VERSION}..."
     pushd "${src}" > /dev/null
+
+    local musl_host=""
+    local musl_cc="gcc"
+    if [[ "${TARGET_ARCH}" == "aarch64" && "${TARGET_ARCH}" != "${HOST_ARCH}" ]]; then
+        musl_host="--host=aarch64-linux-musl"
+        musl_cc="${CROSS_COMPILE}gcc"
+    fi
+
     ./configure \
+        ${musl_host} \
         --prefix="${prefix}" \
         --enable-wrapper=all \
         --syslibdir="${prefix}/lib" \
+        CC="${musl_cc}" \
         CFLAGS="-O2 -pipe" \
         >> "${BUILD_DIR}/musl-build.log" 2>&1
     make -j"${JOBS}" >> "${BUILD_DIR}/musl-build.log" 2>&1
@@ -156,10 +194,19 @@ phase_kernel() {
     info "Configuring kernel ${KERNEL_VERSION}..."
     pushd "${src}" > /dev/null
 
-    # Copy our custom config
-    cp "${ROOT_DIR}/kernel/kernel.config" .config
+    local kernel_config="${ROOT_DIR}/kernel/kernel.config"
+    if [[ "${TARGET_ARCH}" == "aarch64" ]]; then
+        kernel_config="${ROOT_DIR}/kernel/kernel.config.aarch64"
+    fi
 
-    make ARCH="${TARGET_ARCH}" \
+    if [[ -f "${kernel_config}" ]]; then
+        cp "${kernel_config}" .config
+    else
+        warn "Kernel config not found: ${kernel_config}. Falling back to default config."
+        make ARCH="${KERNEL_ARCH}" defconfig >> "${BUILD_DIR}/kernel-config.log" 2>&1
+    fi
+
+    make ARCH="${KERNEL_ARCH}" \
          CROSS_COMPILE="${CROSS_COMPILE}" \
          olddefconfig \
          >> "${BUILD_DIR}/kernel-config.log" 2>&1
@@ -171,7 +218,11 @@ phase_kernel() {
          >> "${BUILD_DIR}/kernel-build.log" 2>&1
 
     # Copy output
-    cp arch/"${TARGET_ARCH}"/boot/bzImage "${BUILD_DIR}/vmlinuz"
+    if [[ "${TARGET_ARCH}" == "aarch64" ]]; then
+        cp arch/"${KERNEL_ARCH}"/boot/Image "${BUILD_DIR}/vmlinuz"
+    else
+        cp arch/"${KERNEL_ARCH}"/boot/bzImage "${BUILD_DIR}/vmlinuz"
+    fi
     popd > /dev/null
 
     ok "Kernel ${KERNEL_VERSION} built: ${BUILD_DIR}/vmlinuz"
@@ -511,11 +562,11 @@ phase_iso() {
 
     # Copy kernel and initrd
     [[ -f "${BUILD_DIR}/vmlinuz"   ]] && cp "${BUILD_DIR}/vmlinuz"   "${iso_root}/boot/"
-    [[ -f "${BUILD_DIR}/initrd.img"]] && cp "${BUILD_DIR}/initrd.img" "${iso_root}/boot/"
+    [[ -f "${BUILD_DIR}/initrd.img" ]] && cp "${BUILD_DIR}/initrd.img" "${iso_root}/boot/"
     [[ -f "${BUILD_DIR}/rootfs.squashfs" ]] && cp "${BUILD_DIR}/rootfs.squashfs" "${iso_root}/live/"
 
     # GRUB config
-    cat > "${iso_root}/boot/grub/grub.cfg" << 'EOF'
+    cat > "${iso_root}/boot/grub/grub.cfg" <<EOF
 set default=0
 set timeout=5
 
@@ -523,30 +574,31 @@ insmod all_video
 insmod gfxterm
 
 menuentry "TinyMightyOS 1.0.0 Live" --class tinymightyos {
-    linux  /boot/vmlinuz root=live:CDLABEL=TINYMIGHTYOS rd.live.image quiet splash
+    linux  /boot/vmlinuz root=live:CDLABEL=${ISO_LABEL} rd.live.image quiet splash
     initrd /boot/initrd.img
 }
 
 menuentry "TinyMightyOS 1.0.0 Live (debug)" --class tinymightyos {
-    linux  /boot/vmlinuz root=live:CDLABEL=TINYMIGHTYOS rd.live.image debug loglevel=7
+    linux  /boot/vmlinuz root=live:CDLABEL=${ISO_LABEL} rd.live.image debug loglevel=7
     initrd /boot/initrd.img
 }
 
 menuentry "Install TinyMightyOS" --class tinymightyos {
-    linux  /boot/vmlinuz root=live:CDLABEL=TINYMIGHTYOS rd.live.image tmos.install=1 quiet
+    linux  /boot/vmlinuz root=live:CDLABEL=${ISO_LABEL} rd.live.image tmos.install=1 quiet
     initrd /boot/initrd.img
 }
 EOF
 
     # Build hybrid ISO
-    if command -v xorriso &>/dev/null && command -v grub-mkrescue &>/dev/null; then
-        grub-mkrescue -o "${BUILD_DIR}/tinymightyos.iso" "${iso_root}" \
-            --volid=TINYMIGHTYOS \
+    if command -v xorriso >/dev/null 2>&1 && command -v grub-mkrescue >/dev/null 2>&1; then
+        grub-mkrescue --target="${GRUB_ISO_TARGET}" \
+            -o "${BUILD_DIR}/tinymightyos.iso" "${iso_root}" \
+            --volid="${ISO_LABEL}" \
             >> "${BUILD_DIR}/iso.log" 2>&1
         ok "ISO built: ${BUILD_DIR}/tinymightyos.iso ($(du -sh "${BUILD_DIR}/tinymightyos.iso" | cut -f1))"
-    elif command -v xorriso &>/dev/null; then
+    elif [[ "${TARGET_ARCH}" == "x86_64" ]] && command -v xorriso >/dev/null 2>&1; then
         xorriso -as mkisofs \
-            -volid "TINYMIGHTYOS" \
+            -volid "${ISO_LABEL}" \
             -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
             -b boot/grub/i386-pc/eltorito.img \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
@@ -556,7 +608,7 @@ EOF
         warn "ISO build had issues — check ${BUILD_DIR}/iso.log"
         ok "ISO: ${BUILD_DIR}/tinymightyos.iso"
     else
-        warn "Neither grub-mkrescue nor xorriso available — skipping ISO"
+        warn "Unable to build ISO for ${TARGET_ARCH} without grub-mkrescue and xorriso"
         # Create a placeholder
         echo "TinyMightyOS ISO placeholder — install grub-mkrescue and xorriso to build" \
             > "${BUILD_DIR}/tinymightyos.iso.README"
@@ -580,8 +632,13 @@ phase_summary() {
         fi
     done
     echo ""
+    echo -e "  ${CYAN}Target architecture:${RESET} ${TARGET_ARCH}"
     echo -e "  ${CYAN}Test with QEMU:${RESET}"
-    echo "    ./scripts/run-qemu.sh"
+    if [[ "${TARGET_ARCH}" == "aarch64" ]]; then
+        echo "    ./scripts/run-qemu.sh --arch=aarch64 --uefi"
+    else
+        echo "    ./scripts/run-qemu.sh"
+    fi
     echo ""
     echo -e "  ${RED}BE UNGOVERNABLE${RESET}"
     echo ""

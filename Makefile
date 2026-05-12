@@ -58,4 +58,5 @@ help:
 	@echo ""
 	@echo "  Variables:"
 	@echo "    JOBS=N         — parallel jobs (default: nproc)"
+	@echo "    TARGET_ARCH    — target architecture (x86_64 or aarch64)"
 	@echo ""

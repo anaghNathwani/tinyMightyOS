@@ -28,7 +28,8 @@ TinyMightyOS
 ├── Package Manager: might — "might work, might not" (it always works)
 ├── Init System: runit-inspired services with parallel startup
 ├── Libc: musl (lean and mean)
-├── Display: wayland-only (X11 is deprecated from birth in TinyMightyOS)
+├── Apple Silicon: aarch64 support for M1/M2/M3/M4 Macs plus standard Intel/AMD support
+├── Install: dual-boot-friendly macOS path with EFI preservation options
 └── Branding: maximum aggression
 ```
 
@@ -40,9 +41,9 @@ TinyMightyOS
 - **Custom kernel config** — tuned for desktop + low latency, BPF enabled everywhere
 - **`tmos-doctor`** — system health checker that roasts your hardware
 - **`tmos-fetch`** — neofetch clone that's 3x more unhinged
-- **UEFI + BIOS bootable ISO** — hybrid ISO via GRUB2 + syslinux
+- **Apple Silicon + UEFI + BIOS bootable ISO** — hybrid ISO via GRUB2, Apple EFI path, and legacy boot support
 - **Immutable rootfs option** — mount root read-only, overlay tmpfs on top
-- **Live ISO + installer** — `tmos-install` guided TUI installer
+- **Live ISO + installer** — `tmos-install` guided TUI installer with dual-boot-safe macOS options
 
 ## Building
 
@@ -56,14 +57,66 @@ TinyMightyOS
 ### Quick Build
 
 ```bash
-# Build everything
+# Build everything for the host architecture
 ./scripts/build-all.sh
+
+# Build for Apple Silicon / aarch64
+TARGET_ARCH=aarch64 ./scripts/build-all.sh
 
 # Build just the ISO
 ./scripts/build-iso.sh
 
 # Build just the rootfs
 ./scripts/build-rootfs.sh
+```
+
+### Apple Silicon / macOS Dual Boot
+
+TinyMightyOS now includes Apple Silicon support with a dual-boot friendly installer.
+The build system can produce aarch64 artifacts and the installer can preserve an existing EFI partition on macOS.
+
+#### Build for Apple Silicon
+
+```bash
+TARGET_ARCH=aarch64 ./scripts/build-all.sh
+```
+
+#### Write the ISO to USB on macOS
+
+1. Build the ISO on Linux or inside a Linux VM/container accessible from macOS.
+2. Copy the ISO to USB with macOS utilities:
+
+```bash
+diskutil list
+sudo diskutil unmountDisk /dev/diskN
+sudo dd if=build/tinymightyos.iso of=/dev/rdiskN bs=4m status=progress
+sync
+```
+
+3. Alternatively use `balenaEtcher` or `Rufus` on a supported host.
+
+#### Booting on Apple Silicon
+
+- Connect the USB installer.
+- Power on the Mac and hold the power button until Startup Options appear.
+- Select the external boot device.
+- If macOS prevents external booting, enable "Allow booting from external media" in macOS Recovery security settings.
+
+#### Installing alongside macOS
+
+- In the installer, choose the target disk.
+- When prompted, enable dual-boot preservation to keep the existing EFI partition.
+- The installer will create a new root partition and preserve the macOS firmware boot environment.
+- After installation, boot into Startup Options again and choose TinyMightyOS from the external or internal boot list.
+
+#### Intel Macs and other UEFI PCs
+
+- The same ISO works on Intel Macs and x86 UEFI PCs.
+- Use `./scripts/run-qemu.sh --uefi` for x86 testing.
+
+```bash
+# Test the aarch64 image in QEMU
+./scripts/run-qemu.sh --arch=aarch64 --uefi
 ```
 
 ### Outputs
@@ -86,6 +139,9 @@ TinyMightyOS
 
 # UEFI mode
 ./scripts/run-qemu.sh --uefi
+
+# Apple Silicon / aarch64 QEMU
+./scripts/run-qemu.sh --arch=aarch64 --uefi
 ```
 
 ## Package Manager: `might`
