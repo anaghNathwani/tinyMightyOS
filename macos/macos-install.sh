@@ -128,7 +128,8 @@ APPLESCRIPT
 
 write_iso_to_target() {
   local target=$1
-  local raw=$(echo "$target" | sed 's/disk/rdisk/')
+  local raw
+  raw=$(echo "$target" | sed 's|/dev/disk|/dev/rdisk|')
   info "Unmounting ${target}"
   diskutil unmountDisk force "$target" >/dev/null 2>&1 || true
   info "Writing ISO to ${target} with administrator privileges"
@@ -140,6 +141,49 @@ APPLESCRIPT
   if [[ $? -ne 0 ]]; then
     die "Failed to write ISO to ${target}"
   fi
+
+  bless_efi_partition "${target}"
+}
+
+bless_efi_partition() {
+  local target=$1
+  info "Refreshing partition table on ${target}..."
+  sleep 2
+  diskutil list "$target" >/dev/null 2>&1 || true
+
+  # Find the EFI partition slice on the target disk
+  local efi_part
+  efi_part=$(diskutil list "$target" 2>/dev/null | awk '/\bEFI\b/ {print $NF; exit}')
+
+  if [[ -z "${efi_part}" ]]; then
+    info "No EFI partition detected on ${target} — skipping bless (volume may not appear in boot picker)"
+    return
+  fi
+
+  # Prepend /dev/ if diskutil printed just the slice name (e.g. disk2s1)
+  [[ "${efi_part}" == /dev/* ]] || efi_part="/dev/${efi_part}"
+
+  info "Blessing EFI partition ${efi_part} so macOS boot manager recognises it..."
+  local mnt="/Volumes/TMOS_EFI_$$"
+
+  # Run mount + bless + unmount with admin rights so Startup Options shows the entry
+  local bless_cmd
+  bless_cmd="$(cat <<SH
+mkdir -p '${mnt}' \
+  && diskutil mount -mountPoint '${mnt}' '${efi_part}' \
+  && ( bless --mount '${mnt}' --setBoot --file '${mnt}/EFI/BOOT/BOOTX64.EFI' 2>/dev/null \
+       || bless --mount '${mnt}' --setBoot 2>/dev/null ) \
+  ; diskutil unmount force '${efi_part}' 2>/dev/null \
+  ; rmdir '${mnt}' 2>/dev/null \
+  ; true
+SH
+)"
+
+  osascript <<APPLESCRIPT
+  do shell script "${bless_cmd}" with administrator privileges
+APPLESCRIPT
+
+  info "EFI partition blessed — TinyMightyOS should now appear in Startup Options / boot picker"
 }
 
 main() {
