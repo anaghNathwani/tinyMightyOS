@@ -45,7 +45,7 @@ ensure_brew() {
 
 install_brew_deps() {
   ensure_brew
-  local packages=(gcc make bash wget xorriso squashfs)
+  local packages=(gcc make bash wget xorriso squashfs grub)
   info "Installing missing Homebrew packages: ${packages[*]}"
   brew update >/dev/null 2>&1 || true
   brew install "${packages[@]}" || die "Failed to install Homebrew packages"
@@ -68,61 +68,100 @@ build_iso() {
   info "ISO built successfully"
 }
 
-get_disk_choices() {
-  diskutil list | awk '/^\/dev\/disk[0-9]+/ {print $1} /^[[:space:]]+[0-9]+:/ {print $NF}' | sort -u
-}
+list_target_disks() {
+  # Returns lines of: /dev/diskN<TAB>SIZE<TAB>NAME
+  diskutil list -plist external physical 2>/dev/null | \
+    python3 - <<'PYEOF'
+import plistlib, sys, subprocess, os
 
-build_disk_list() {
-  local disks
-  mapfile -t disks < <(get_disk_choices)
-  local items=()
-  for disk in "${disks[@]}"; do
-    disk_info=$(diskutil info "$disk")
-    local size
-    size=$(printf '%s\n' "$disk_info" | awk -F: '/Disk Size:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
-    local internal
-    internal=$(printf '%s\n' "$disk_info" | awk -F: '/Internal:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
-    local protocol
-    protocol=$(printf '%s\n' "$disk_info" | awk -F: '/Protocol:/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
-    items+=("${disk} — ${size} — ${protocol} — ${internal}")
-  done
-  printf '%s\n' "${items[@]}"
+raw = sys.stdin.buffer.read()
+try:
+    pl = plistlib.loads(raw)
+except Exception:
+    sys.exit(0)
+
+for node in pl.get("WholeDisks", []):
+    info_raw = subprocess.run(
+        ["diskutil", "info", "-plist", node],
+        capture_output=True
+    ).stdout
+    try:
+        info = plistlib.loads(info_raw)
+    except Exception:
+        continue
+    dev  = info.get("DeviceNode", node)
+    size = info.get("TotalSize", 0)
+    name = info.get("MediaName") or info.get("IORegistryEntryName") or "Unknown"
+    gb   = size / 1_000_000_000
+    print(f"{dev}\t{gb:.1f} GB\t{name}")
+PYEOF
 }
 
 choose_target_disk() {
   local disk_lines
-  disk_lines=$(build_disk_list)
-  if [[ -z "${disk_lines}" ]]; then
-    die "No disks found for installation"
+  disk_lines=$(list_target_disks)
+
+  if [[ -z "$disk_lines" ]]; then
+    die "No external/physical disks found. Plug in the target drive and try again."
   fi
 
-  local selected
-  selected=$(osascript <<APPLESCRIPT
-set diskLines to paragraphs of "${disk_lines}"
-set chosenDisk to choose from list diskLines with prompt "Select the internal target disk for TinyMightyOS. Choose a partition or disk that is safe to overwrite." default items {item 1 of diskLines}
-if chosenDisk is false then
-    return ""
+  # Build parallel arrays: display labels and device nodes
+  local labels=() devs=()
+  while IFS=$'\t' read -r dev size name; do
+    devs+=("$dev")
+    labels+=("$dev  —  $size  —  $name")
+  done <<< "$disk_lines"
+
+  # Pass label list to AppleScript as a comma-separated string
+  local as_list
+  as_list=$(printf '"%s",' "${labels[@]}")
+  as_list="${as_list%,}"  # strip trailing comma
+
+  local chosen_label
+  chosen_label=$(osascript <<APPLESCRIPT
+set diskList to {${as_list}}
+set chosen to choose from list diskList with prompt "Choose the disk to install TinyMightyOS onto.
+
+WARNING: The selected disk will be completely wiped." with title "TinyMightyOS Installer" OK button name "Select" cancel button name "Cancel"
+if chosen is false then
+  return ""
 end if
-return item 1 of chosenDisk
+return item 1 of chosen
 APPLESCRIPT
   )
 
-  if [[ -z "${selected}" ]]; then
+  if [[ -z "$chosen_label" ]]; then
     die "Installation cancelled"
   fi
-  awk '{print $1}' <<< "${selected}"
+
+  # Match chosen label back to device node
+  local i
+  for i in "${!labels[@]}"; do
+    if [[ "${labels[$i]}" == "$chosen_label" ]]; then
+      echo "${devs[$i]}"
+      return
+    fi
+  done
+
+  die "Could not match selection to a disk device"
 }
 
 confirm_target() {
   local target=$1
-  osascript <<APPLESCRIPT
-set confirmText to "TinyMightyOS will be installed to ${target}. Existing data may be overwritten. Continue?"
-set answer to display dialog confirmText buttons {"Cancel", "Continue"} default button "Cancel" with icon caution
-if button returned of answer is "Continue" then
-    return "yes"
-else
+  osascript - "$target" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set tgt to item 1 of argv
+  set confirmText to "⚠️  FINAL WARNING" & return & return & "You are about to ERASE all data on:" & return & return & tgt & return & return & "This cannot be undone. Are you absolutely sure?"
+  try
+    set answer to display dialog confirmText buttons {"Cancel", "Erase and Install"} default button "Cancel" with icon stop
+    if button returned of answer is "Erase and Install" then
+      return "yes"
+    end if
+  on error
     return ""
-end if
+  end try
+  return ""
+end run
 APPLESCRIPT
 }
 
@@ -134,9 +173,13 @@ write_iso_to_target() {
   diskutil unmountDisk force "$target" >/dev/null 2>&1 || true
   info "Writing ISO to ${target} with administrator privileges"
 
-  local shell_cmd="diskutil unmountDisk force '${target}' >/dev/null 2>&1; dd if='${ISO_PATH}' of='${raw}' bs=4m conv=sync status=progress; sync"
-  osascript <<APPLESCRIPT
-  do shell script "${shell_cmd}" with administrator privileges
+  osascript - "$ISO_PATH" "$target" <<'APPLESCRIPT'
+on run argv
+  set isoPath to item 1 of argv
+  set targetDisk to item 2 of argv
+  set shell_cmd to "dd if=" & quoted form of isoPath & " of=" & quoted form of targetDisk & " bs=4m status=progress && sync"
+  do shell script shell_cmd with administrator privileges
+end run
 APPLESCRIPT
   if [[ $? -ne 0 ]]; then
     die "Failed to write ISO to ${target}"
@@ -193,7 +236,7 @@ main() {
 
   local target
   target=$(choose_target_disk)
-  [[ -n "${target}" ]] || die "No target selected"
+  [[ -n "${target}" ]] || die "No disk selected"
 
   local confirmed
   confirmed=$(confirm_target "${target}")
@@ -203,9 +246,12 @@ main() {
 
   write_iso_to_target "${target}"
 
-  osascript <<APPLESCRIPT
-set successText to "TinyMightyOS has been written to ${target}.\n\nRestart the Mac and hold the power button to open Startup Options. Select the TinyMightyOS volume to continue installation."
-display dialog successText buttons {"OK"} default button "OK"
+  osascript - "$target" <<'APPLESCRIPT'
+on run argv
+  set tgt to item 1 of argv
+  set successText to "TinyMightyOS has been written to:" & return & return & tgt & return & return & "You can now remove the drive and boot from it."
+  display dialog successText buttons {"OK"} default button "OK"
+end run
 APPLESCRIPT
 }
 

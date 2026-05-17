@@ -96,12 +96,29 @@ The installer will:
 
 ### Post-Installation Boot
 
-After installation completes:
+**The installer handles the reboot for you.** After writing the disk, a dialog will appear. Click **"Reboot Now"** — the Mac restarts automatically and lands on the startup options screen without any button-holding.
 
-1. Reboot the Mac
-2. Hold the **power button** until Startup Options appear
-3. Select the new Linux volume from the boot list
-4. Complete first-boot setup (varies by distro)
+#### Apple Silicon Security Setup (one-time, required)
+
+Apple Silicon Macs must have external booting enabled before a Linux drive appears in the boot picker. The installer triggers this automatically on first run. Once the Mac restarts:
+
+| Step | What to do |
+|------|------------|
+| 1 | Click **Options** on the startup screen |
+| 2 | Select your user account and enter your password |
+| 3 | Menu bar: **Utilities → Startup Security Utility** |
+| 4 | Click **Security Policy...** |
+| 5 | Select **Reduced Security** |
+| 6 | Check **"Allow booting from external or removable media"** |
+| 7 | Click **OK** → Apple menu → **Restart** |
+
+This is a one-time step. The setting persists across reboots — you will never need to do it again for this Mac.
+
+> **Why can't the script do this automatically?** Apple's Secure Enclave Processor (SEP) cryptographically verifies that security policy changes happen from a hardware-authenticated state. No software call or NVRAM variable can satisfy this check from a running OS — it is a deliberate hardware invariant. The script gets you to the right screen automatically (`nvram auto-boot=false`); the 5-click GUI sequence is the minimum the hardware allows.
+
+#### Booting Linux after setup
+
+After the one-time security step, hold the **Power button** at any startup until "Loading startup options..." appears, then select your Linux drive.
 
 ### Switching Between Distros
 
@@ -166,9 +183,7 @@ The installer GUI will guide you through disk selection and perform the necessar
 
 #### Booting on Apple Silicon
 
-- After the installer finishes writing the internal install image, reboot the Mac and hold the power button until Startup Options appear.
-- Select the TinyMightyOS target volume from the internal boot list.
-- If the volume does not appear, boot into Recovery and ensure the Mac is allowed to boot from new internal volumes.
+The installer automatically reboots into the startup options screen when it finishes. Follow the [Apple Silicon Security Setup](#apple-silicon-security-setup-one-time-required) steps shown above. After that one-time setup, hold the **Power button** at startup to open the boot picker and select your Linux drive.
 
 #### Installing alongside macOS (Dual Boot)
 
@@ -192,10 +207,9 @@ chmod +x ./scripts/might ./macos/macos-install.sh
 
 ##### Notes for Apple Silicon dual boot
 
-- If the Mac does not show the TinyMightyOS volume, reboot and hold the power button to choose the internal volume from the firmware boot picker.
-- Apple Silicon boots through Startup Options, so TinyMightyOS may appear only after selecting the new internal volume manually.
-- To keep macOS first and TinyMightyOS second, install TinyMightyOS to a separate internal volume and use Startup Options at boot.
-- To remove TinyMightyOS later, boot into macOS Recovery, use Disk Utility to delete the TinyMightyOS volume, and restore free space to the APFS container.
+- If the Linux volume does not appear in the boot picker, the one-time security setup (Reduced Security + external boot) may not have been completed. Follow the steps in the [Apple Silicon Security Setup](#apple-silicon-security-setup-one-time-required) section above.
+- To switch between macOS and Linux: hold the **Power button** at startup, then select the desired volume.
+- To remove Linux later: boot into macOS Recovery, use Disk Utility to delete the Linux volume, and restore free space to the APFS container.
 
 #### Intel Macs and other UEFI PCs
 
